@@ -1,0 +1,60 @@
+[Unit]
+Description=CI Runner Console
+Documentation=https://github.com/C-Nucifora/ci-runner-console
+After=network-online.target
+Wants=network-online.target
+# Acceptance criterion 7: always come back after a reboot or crash, with no
+# restart-rate ceiling that could leave the console down after a rough boot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ciconsole
+Group=ciconsole
+WorkingDirectory=/opt/ci-runner-console
+ExecStart=/usr/bin/node /opt/ci-runner-console/dist/index.js
+
+# Secrets live only in this root-owned 0600 file, which systemd reads as root and
+# hands to the service. Nothing sensitive is in the unit or on the command line.
+EnvironmentFile=/etc/ci-runner-console.env
+
+Restart=always
+RestartSec=3
+
+# This process holds an SSH key that reaches a machine which executes CI code, so
+# it gets the smallest surface the application can still work in.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# AF_NETLINK is required: Node enumerates local interfaces when the server binds
+# to a wildcard address, and without it startup fails with EAFNOSUPPORT.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# The audit log is the only thing this service writes.
+ReadWritePaths=/var/lib/ci-runner-console
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ci-runner-console
+
+[Install]
+WantedBy=multi-user.target

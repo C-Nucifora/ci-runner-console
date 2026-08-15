@@ -1,0 +1,550 @@
+/*
+ * Palette roles from the reference data-viz instance. Light and dark are both
+ * selected sets stepped for their own surface, not an automatic inversion.
+ * Status colors are fixed across modes by design and always ship beside a text
+ * label, never as the only signal.
+ */
+:root {
+  color-scheme: light;
+
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+
+  /* sequential blue ramp — meters and activity */
+  --seq-track: #cde2fb;
+  --seq-fill: #2a78d6;
+  --seq-strong: #184f95;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --success-text: #006300;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgba(11, 11, 11, 0.05), 0 1px 6px rgba(11, 11, 11, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme='light'])) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+    --seq-track: #184f95;
+    --seq-fill: #3987e5;
+    --seq-strong: #86b6ef;
+    --success-text: #0ca30c;
+    --shadow: none;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 15px/1.55 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* ---------------------------------------------------------------- layout */
+
+.shell {
+  max-width: 76rem;
+  margin: 0 auto;
+  padding: 1.75rem 1.5rem 5rem;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.35rem;
+}
+
+.topbar h1 {
+  font-size: 1.35rem;
+  font-weight: 620;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.topbar .who {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.subtitle {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin: 0 0 1.5rem;
+}
+
+.subtitle code {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.35rem;
+  font-size: 0.8rem;
+}
+
+section {
+  margin-bottom: 1.75rem;
+}
+
+h2 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+  font-weight: 620;
+  margin: 0 0 0.7rem;
+}
+
+/* ------------------------------------------------------------ stat tiles */
+
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.85rem;
+}
+
+.tile {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.95rem 1.05rem;
+  box-shadow: var(--shadow);
+}
+
+.tile .label {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+
+.tile .value {
+  font-size: 1.85rem;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  /* Keeps a figure and its unit on one line so tiles stay the same height. */
+  white-space: nowrap;
+}
+
+.tile .value .of {
+  font-size: 0.95rem;
+  font-weight: 450;
+  color: var(--text-muted);
+  letter-spacing: 0;
+}
+
+.tile .foot {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  margin-top: 0.3rem;
+}
+
+/* ---------------------------------------------------------------- meters */
+
+/* Track is a lighter step of the fill's own ramp, so the bar reads as one
+   object rather than a fill floating on grey. */
+.meter {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--seq-track);
+  overflow: hidden;
+  margin-top: 0.55rem;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--seq-fill);
+  transition: width 0.3s ease;
+}
+
+.meter[data-severity='warning'] > span {
+  background: var(--status-warning);
+}
+.meter[data-severity='critical'] > span {
+  background: var(--status-critical);
+}
+
+/* ---------------------------------------------------------------- table */
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+thead th {
+  text-align: left;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 620;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--gridline);
+  white-space: nowrap;
+}
+
+tbody td {
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--gridline);
+  vertical-align: top;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr.attention {
+  background: color-mix(in srgb, var(--status-warning) 7%, transparent);
+}
+
+.runner-name {
+  font-weight: 560;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.runner-detail {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+  max-width: 34rem;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.chip {
+  font-size: 0.72rem;
+  padding: 0.1rem 0.42rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  background: var(--page);
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------- badges */
+
+/* Status colour never carries meaning alone: every badge shows a glyph and a
+   word as well, which is also what covers the sub-3:1 warning step on light. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 560;
+  padding: 0.13rem 0.5rem 0.13rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.badge .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.badge[data-tone='good'] .dot {
+  background: var(--status-good);
+}
+.badge[data-tone='busy'] .dot {
+  background: var(--seq-fill);
+}
+.badge[data-tone='warning'] .dot {
+  background: var(--status-warning);
+}
+.badge[data-tone='critical'] .dot {
+  background: var(--status-critical);
+}
+.badge[data-tone='idle'] .dot {
+  background: var(--baseline);
+}
+
+.badge[data-tone='good'] {
+  background: color-mix(in srgb, var(--status-good) 10%, transparent);
+}
+.badge[data-tone='busy'] {
+  background: color-mix(in srgb, var(--seq-fill) 12%, transparent);
+}
+.badge[data-tone='warning'] {
+  background: color-mix(in srgb, var(--status-warning) 16%, transparent);
+}
+.badge[data-tone='critical'] {
+  background: color-mix(in srgb, var(--status-critical) 12%, transparent);
+}
+
+/* --------------------------------------------------------------- buttons */
+
+button {
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 520;
+  padding: 0.32rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--baseline);
+  background: var(--page);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--seq-fill);
+  border-color: var(--seq-fill);
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--seq-strong);
+  border-color: var(--seq-strong);
+}
+
+button.danger {
+  color: var(--status-critical);
+  border-color: color-mix(in srgb, var(--status-critical) 40%, var(--border));
+}
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--seq-fill);
+  padding: 0.1rem 0.2rem;
+  text-decoration: underline;
+}
+
+.actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ----------------------------------------------------------------- forms */
+
+form.add-runner {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding: 1rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+}
+
+.field label {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  font-weight: 520;
+}
+
+.field input {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.38rem 0.55rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--baseline);
+  background: var(--page);
+  color: var(--text-primary);
+  min-width: 15rem;
+}
+
+.field input:focus {
+  outline: 2px solid var(--seq-fill);
+  outline-offset: -1px;
+}
+
+.field .hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------- notices */
+
+.notice {
+  border-radius: var(--radius);
+  padding: 0.7rem 0.95rem;
+  font-size: 0.85rem;
+  border: 1px solid var(--border);
+  margin-bottom: 0.75rem;
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+
+.notice .glyph {
+  flex: none;
+  font-weight: 700;
+}
+
+.notice[data-tone='error'] {
+  background: color-mix(in srgb, var(--status-critical) 9%, transparent);
+  border-color: color-mix(in srgb, var(--status-critical) 35%, transparent);
+}
+
+.notice[data-tone='warning'] {
+  background: color-mix(in srgb, var(--status-warning) 14%, transparent);
+  border-color: color-mix(in srgb, var(--status-warning) 40%, transparent);
+}
+
+.notice[data-tone='success'] {
+  background: color-mix(in srgb, var(--status-good) 9%, transparent);
+  border-color: color-mix(in srgb, var(--status-good) 32%, transparent);
+}
+
+.notice .hint {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+/* ----------------------------------------------------------------- audit */
+
+.audit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.82rem;
+}
+
+.audit-list li {
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--gridline);
+  display: flex;
+  gap: 0.7rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.audit-list li:last-child {
+  border-bottom: none;
+}
+
+.audit-list time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.audit-list .who {
+  font-weight: 560;
+}
+
+.audit-list .err {
+  color: var(--status-critical);
+  width: 100%;
+  font-size: 0.78rem;
+}
+
+.empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  padding: 1.25rem;
+  max-width: 38rem;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.25);
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+dialog h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+}
+
+pre.logs {
+  background: var(--page);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem;
+  max-height: 24rem;
+  overflow: auto;
+  font-size: 0.74rem;
+  line-height: 1.45;
+  margin: 0 0 0.9rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.spin {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}

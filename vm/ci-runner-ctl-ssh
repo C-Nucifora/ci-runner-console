@@ -1,0 +1,63 @@
+#!/bin/bash
+# ci-runner-ctl-ssh — forced command for the control plane's SSH key.
+#
+# The key that reaches this VM is pinned to this script in authorized_keys, so a
+# compromised control plane cannot obtain a shell, forward a port, or run anything
+# outside the allowlist below. The requested operation arrives as a base64-encoded
+# JSON argv array in SSH_ORIGINAL_COMMAND; it is decoded structurally and never
+# passed through a shell, so quoting and word-splitting cannot be used to smuggle
+# extra arguments.
+#
+# stdin passes through untouched so short-lived GitHub tokens never appear in argv
+# or in this host's process table.
+
+set -euo pipefail
+
+deny() { printf '{"ok":false,"error":"%s"}\n' "$1" >&2; exit 42; }
+
+[[ -n ${SSH_ORIGINAL_COMMAND:-} ]] || deny "no command"
+(( ${#SSH_ORIGINAL_COMMAND} <= 4096 )) || deny "request too large"
+[[ $SSH_ORIGINAL_COMMAND =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || deny "malformed request"
+
+# Decode into NUL-terminated arguments. Anything that is not a small flat array of
+# plain strings is rejected here rather than downstream.
+#
+# The decoded form is NUL-delimited, so it must not pass through a command
+# substitution — bash silently drops NUL bytes there, which would concatenate every
+# argument into one token. Stage it in a private temp file instead.
+tmp=$(mktemp) || deny "internal error"
+chmod 0600 "$tmp"
+trap 'rm -f "$tmp"' EXIT
+
+if ! printf '%s' "$SSH_ORIGINAL_COMMAND" | python3 -c '
+import base64, json, sys
+try:
+    payload = json.loads(base64.b64decode(sys.stdin.buffer.read(), validate=True))
+except Exception:
+    sys.exit(1)
+if not isinstance(payload, list) or not 1 <= len(payload) <= 8:
+    sys.exit(1)
+# Empty strings are allowed: an optional positional argument such as "no extra
+# labels" arrives as one. Their meaning is validated by ci-runner-ctl, which is
+# where the semantics live; this layer only bounds shape and size.
+if not all(isinstance(a, str) and "\0" not in a and len(a) <= 256 for a in payload):
+    sys.exit(1)
+if not isinstance(payload[0], str) or not payload[0]:
+    sys.exit(1)
+sys.stdout.write("".join(a + "\0" for a in payload))
+' >"$tmp" 2>/dev/null; then
+  deny "malformed request"
+fi
+
+readarray -d '' -t ARGS <"$tmp"
+rm -f "$tmp"
+trap - EXIT
+
+(( ${#ARGS[@]} >= 1 )) || deny "empty command"
+
+case ${ARGS[0]} in
+  list|headroom|status|logs|start|stop|restart|create|remove) ;;
+  *) deny "operation not permitted" ;;
+esac
+
+exec sudo -n /usr/local/sbin/ci-runner-ctl "${ARGS[@]}"

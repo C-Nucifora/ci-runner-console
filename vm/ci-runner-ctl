@@ -1,0 +1,300 @@
+#!/bin/bash
+# ci-runner-ctl — the only privileged operation the control plane may perform on this VM.
+#
+# Runs as root. Every subcommand is parameterised and every parameter is validated
+# here as well as in the SSH wrapper, so a bug or bypass in one layer is not sufficient
+# on its own. Nothing from the caller is ever passed to a shell for evaluation.
+#
+# Output is a single JSON document on stdout. Diagnostics go to stderr.
+
+set -euo pipefail
+
+CONF=/etc/ci-runner-ctl.conf
+RUNNERS_DIR=/opt/runners
+LEGACY_DIR=/opt/actions-runner
+DIST_DIR=/opt/runner-dist
+RUNNER_USER=runner
+
+MAX_RUNNERS=3
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && source "$CONF"
+
+die() { printf '%s\n' "{\"ok\":false,\"error\":$(json_str "$1")}"; exit "${2:-1}"; }
+
+json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
+
+# ---------------------------------------------------------------- validation
+
+# GitHub runner names: letters, digits, dot, dash, underscore. Must start
+# alphanumeric. Bounded length. This is also what makes $RUNNERS_DIR/$name safe.
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; }
+valid_labels() { [[ $1 =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]; }
+valid_url() { [[ $1 =~ ^https://github\.com/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]]; }
+valid_group() { [[ $1 =~ ^[A-Za-z0-9._\ -]{1,64}$ ]]; }
+valid_lines() { [[ $1 =~ ^[0-9]{1,4}$ ]]; }
+
+require_name() {
+  valid_name "$1" || die "invalid runner name"
+  # Belt and braces: reject anything that could escape the runners directory even
+  # if the regex above were ever loosened.
+  [[ $1 != *..* && $1 != */* ]] || die "invalid runner name"
+}
+
+# Read a short-lived GitHub token from stdin. Never appears in argv, never logged,
+# never written to disk by us.
+read_token() {
+  local t
+  IFS= read -r t || true
+  [[ -n ${t:-} ]] || die "expected token on stdin"
+  [[ $t =~ ^[A-Za-z0-9._-]{10,255}$ ]] || die "malformed token"
+  printf '%s' "$t"
+}
+
+# ---------------------------------------------------------------- discovery
+
+# Echoes "dir<TAB>name<TAB>unit" for each runner instance present on this VM.
+# A directory counts as an instance if it has config.sh, whether or not it has
+# been registered — an unregistered directory is a real state worth surfacing.
+enumerate() {
+  local d name unit
+  for d in "$LEGACY_DIR" "$RUNNERS_DIR"/*; do
+    [[ -d $d && -x $d/config.sh ]] || continue
+    name=''
+    [[ -r $d/.runner ]] && name=$(python3 -c '
+import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("agentName",""))
+except Exception:
+    print("")' "$d/.runner" 2>/dev/null || true)
+    [[ -z $name ]] && name=$(basename "$d")
+    unit=''
+    [[ -r $d/.service ]] && unit=$(tr -d '\n\r' < "$d/.service")
+    printf '%s\t%s\t%s\n' "$d" "$name" "$unit"
+  done
+}
+
+dir_for() {
+  local want=$1 d n u
+  while IFS=$'\t' read -r d n u; do
+    [[ $n == "$want" ]] && { printf '%s' "$d"; return 0; }
+  done < <(enumerate)
+  return 1
+}
+
+unit_for() {
+  local d=$1
+  [[ -r $d/.service ]] || return 1
+  tr -d '\n\r' < "$d/.service"
+}
+
+# `systemctl is-active` prints the state and *also* exits non-zero for anything
+# that is not active, so `cmd || echo unknown` would emit both words. Capture
+# first, then fall back only when there was genuinely no output.
+unit_active() {
+  local state
+  state=$(systemctl is-active "$1" 2>/dev/null) || true
+  printf '%s' "${state:-unknown}"
+}
+
+# ---------------------------------------------------------------- subcommands
+
+cmd_list() {
+  local d n u active enabled substate since
+  {
+    printf '{"ok":true,"instances":['
+    local first=1
+    while IFS=$'\t' read -r d n u; do
+      [[ $first == 1 ]] || printf ','
+      first=0
+      active=''; enabled=''; substate=''; since=''
+      if [[ -n $u ]]; then
+        active=$(systemctl is-active "$u" 2>/dev/null || true)
+        enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
+        substate=$(systemctl show -p SubState --value "$u" 2>/dev/null || true)
+        since=$(systemctl show -p ActiveEnterTimestamp --value "$u" 2>/dev/null || true)
+      fi
+      python3 - "$d" "$n" "$u" "$active" "$enabled" "$substate" "$since" <<'PY'
+import json,sys,os
+d,n,u,active,enabled,substate,since = sys.argv[1:8]
+# .credentials is the actual registration; .runner alone only records intent, and
+# treating the two as equivalent would merge a half-configured directory with a
+# real GitHub registration of the same name.
+registered = os.path.exists(os.path.join(d,".credentials"))
+print(json.dumps({
+  "dir": d, "name": n, "unit": u or None,
+  "registered": registered,
+  "serviceInstalled": bool(u) and os.path.exists("/etc/systemd/system/"+u),
+  "active": active or None, "enabled": enabled or None,
+  "subState": substate or None, "activeSince": since or None,
+  "legacy": d == os.environ.get("LEGACY_DIR","/opt/actions-runner"),
+}), end="")
+PY
+    done < <(enumerate)
+    printf ']}\n'
+  }
+}
+
+cmd_headroom() {
+  local count
+  count=$(enumerate | wc -l)
+  python3 - "$count" "$MAX_RUNNERS" <<'PY'
+import json,os,sys,shutil
+count,cap = int(sys.argv[1]), int(sys.argv[2])
+mem = {}
+for line in open("/proc/meminfo"):
+    k,_,v = line.partition(":")
+    mem[k] = int(v.split()[0]) * 1024
+total,used,free = shutil.disk_usage("/")
+load1,load5,load15 = os.getloadavg()
+print(json.dumps({
+  "ok": True,
+  "cpus": os.cpu_count(),
+  "load": {"one": round(load1,2), "five": round(load5,2), "fifteen": round(load15,2)},
+  "memory": {"totalBytes": mem.get("MemTotal",0), "availableBytes": mem.get("MemAvailable",0)},
+  "disk": {"totalBytes": total, "freeBytes": free},
+  "instances": count,
+  "cap": cap,
+  "remaining": max(0, cap - count),
+}))
+PY
+}
+
+cmd_status() {
+  local name=$1 d u
+  require_name "$name"
+  d=$(dir_for "$name") || die "no such runner instance: $name"
+  u=$(unit_for "$d" || true)
+  python3 - "$d" "$name" "$u" \
+    "$([[ -n $u ]] && systemctl is-active "$u" 2>/dev/null || true)" \
+    "$([[ -n $u ]] && systemctl is-enabled "$u" 2>/dev/null || true)" <<'PY'
+import json,sys,os
+d,name,u,active,enabled = sys.argv[1:6]
+print(json.dumps({"ok":True,"name":name,"dir":d,"unit":u or None,
+  "active":active or None,"enabled":enabled or None,
+  "registered": os.path.exists(os.path.join(d,".credentials"))}))
+PY
+}
+
+cmd_logs() {
+  local name=$1 lines=${2:-200} d u
+  require_name "$name"
+  valid_lines "$lines" || die "invalid line count"
+  d=$(dir_for "$name") || die "no such runner instance: $name"
+  u=$(unit_for "$d") || die "runner $name has no installed service"
+  journalctl -u "$u" -n "$lines" --no-pager -o short-iso 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.dumps({"ok":True,"lines":sys.stdin.read().splitlines()}))'
+}
+
+svc_action() {
+  local name=$1 action=$2 d u
+  require_name "$name"
+  d=$(dir_for "$name") || die "no such runner instance: $name"
+  u=$(unit_for "$d") || die "runner $name has no installed service"
+  systemctl "$action" "$u" >&2 || die "systemctl $action failed for $u"
+  # enable/disable alongside start/stop so the state survives a VM reboot.
+  case $action in
+    start)   systemctl enable "$u" >&2 2>/dev/null || true ;;
+    stop)    systemctl disable "$u" >&2 2>/dev/null || true ;;
+  esac
+  printf '{"ok":true,"name":%s,"unit":%s,"action":%s,"active":%s}\n' \
+    "$(json_str "$name")" "$(json_str "$u")" "$(json_str "$action")" \
+    "$(json_str "$(unit_active "$u")")"
+}
+
+cmd_create() {
+  local name=$1 labels=$2 url=$3 group=${4:-}
+  require_name "$name"
+  # No extra labels is a legitimate choice: the runner still gets GitHub's
+  # automatic self-hosted/Linux/X64 set.
+  [[ -z $labels ]] || valid_labels "$labels" || die "invalid labels"
+  valid_url "$url" || die "invalid GitHub URL"
+  [[ -z $group ]] || valid_group "$group" || die "invalid runner group"
+
+  local count
+  count=$(enumerate | wc -l)
+  (( count < MAX_RUNNERS )) || die "runner cap reached ($count/$MAX_RUNNERS)"
+
+  dir_for "$name" >/dev/null 2>&1 && die "a runner instance named $name already exists"
+
+  local dist
+  dist=$(ls -1 "$DIST_DIR"/actions-runner-linux-x64-*.tar.gz 2>/dev/null | sort -V | tail -1) \
+    || die "no runner distribution staged in $DIST_DIR"
+  [[ -r $dist ]] || die "no runner distribution staged in $DIST_DIR"
+
+  local token
+  token=$(read_token)
+
+  local d=$RUNNERS_DIR/$name
+  mkdir -p "$d"
+  # Fresh unpack every time. Never copy another instance's directory — .credentials
+  # and .runner are per-registration and sharing them corrupts both runners.
+  tar xzf "$dist" -C "$d"
+  chown -R "$RUNNER_USER":"$RUNNER_USER" "$d"
+
+  local args=(--unattended --url "$url" --token "$token" --name "$name"
+              --work _work --replace=false)
+  # config.sh rejects an empty --labels value, so omit the flag entirely rather
+  # than passing "".
+  [[ -n $labels ]] && args+=(--labels "$labels")
+  [[ -n $group ]] && args+=(--runnergroup "$group")
+
+  if ! sudo -u "$RUNNER_USER" -H "$d/config.sh" "${args[@]}" >&2; then
+    rm -rf "$d"
+    die "config.sh failed; instance directory removed"
+  fi
+
+  if ! ( cd "$d" && ./svc.sh install "$RUNNER_USER" >&2 && ./svc.sh start >&2 ); then
+    # Leave GitHub clean if the service could not be brought up.
+    sudo -u "$RUNNER_USER" -H "$d/config.sh" remove --token "$token" >&2 2>/dev/null || true
+    rm -rf "$d"
+    die "service install/start failed; instance rolled back"
+  fi
+
+  local u
+  u=$(unit_for "$d" || echo '')
+  [[ -n $u ]] && systemctl enable "$u" >&2 2>/dev/null || true
+  printf '{"ok":true,"name":%s,"dir":%s,"unit":%s,"active":%s}\n' \
+    "$(json_str "$name")" "$(json_str "$d")" "$(json_str "$u")" \
+    "$(json_str "$([[ -n $u ]] && unit_active "$u" || echo unknown)")"
+}
+
+cmd_remove() {
+  local name=$1 d u token
+  require_name "$name"
+  d=$(dir_for "$name") || die "no such runner instance: $name"
+  [[ $d != "$LEGACY_DIR" ]] || die "refusing to remove the pre-existing $LEGACY_DIR instance"
+
+  token=$(read_token)
+
+  u=$(unit_for "$d" || echo '')
+  if [[ -n $u ]]; then
+    systemctl stop "$u" >&2 2>/dev/null || true
+    systemctl disable "$u" >&2 2>/dev/null || true
+    ( cd "$d" && ./svc.sh uninstall >&2 2>/dev/null ) || true
+  fi
+  # Deregister from GitHub before deleting the directory. If this fails the caller
+  # still removes the GitHub side over the API, but doing it here keeps the runner's
+  # own view consistent.
+  local deregistered=true
+  sudo -u "$RUNNER_USER" -H "$d/config.sh" remove --token "$token" >&2 || deregistered=false
+  rm -rf "$d"
+  printf '{"ok":true,"name":%s,"deregisteredLocally":%s}\n' "$(json_str "$name")" "$deregistered"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+[[ $EUID -eq 0 ]] || die "ci-runner-ctl must run as root"
+[[ $# -ge 1 ]] || die "no subcommand"
+
+sub=$1; shift
+case $sub in
+  list)     [[ $# -eq 0 ]] || die "list takes no arguments"; cmd_list ;;
+  headroom) [[ $# -eq 0 ]] || die "headroom takes no arguments"; cmd_headroom ;;
+  status)   [[ $# -eq 1 ]] || die "status takes 1 argument"; cmd_status "$1" ;;
+  logs)     [[ $# -ge 1 && $# -le 2 ]] || die "logs takes 1-2 arguments"; cmd_logs "$@" ;;
+  start|stop|restart)
+            [[ $# -eq 1 ]] || die "$sub takes 1 argument"; svc_action "$1" "$sub" ;;
+  create)   [[ $# -ge 3 && $# -le 4 ]] || die "create takes 3-4 arguments"; cmd_create "$@" ;;
+  remove)   [[ $# -eq 1 ]] || die "remove takes 1 argument"; cmd_remove "$1" ;;
+  *)        die "unknown subcommand" ;;
+esac

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-test/
+web/dist/
+*.log
+
+# Secrets never belong in this repo. Real values live in a root-owned 0600 env
+# file on the host (see deploy/README.md) and are injected by systemd.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_*
+audit/
