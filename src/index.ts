@@ -108,7 +108,7 @@ async function main() {
   app.get('/healthz', async () => ({ status: 'ok', service: 'ci-runner-console' }));
 
   registerAuthRoutes(app, { config, oidc, sessions, loginStates });
-  registerApiRoutes(app, { config, sessions, registry, control, audit });
+  registerApiRoutes(app, { config, sessions, registry, credential, control, audit });
 
   const webRoot = join(dirname(fileURLToPath(import.meta.url)), '..', 'web', 'dist');
   // @fastify/static strips `prefix` before resolving against `root`, so the root

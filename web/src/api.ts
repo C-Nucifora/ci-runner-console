@@ -1,4 +1,4 @@
-import type { AuditEntry, Inventory, Me } from './types';
+import type { AuditEntry, HealthCheck, Inventory, Me, SettingsGroup } from './types';
 
 export class ApiError extends Error {
   constructor(
@@ -43,6 +43,8 @@ export const api = {
   me: () => request<Me>('/api/me'),
   inventory: () => request<Inventory>('/api/inventory'),
   audit: (limit = 100) => request<{ entries: AuditEntry[] }>(`/api/audit?limit=${limit}`),
+  health: () => request<{ checks: HealthCheck[] }>('/api/health'),
+  settings: () => request<{ groups: SettingsGroup[] }>('/api/settings'),
   logs: (name: string) => request<{ lines: string[] }>(`/api/runners/${encodeURIComponent(name)}/logs`),
 
   start: (name: string) => request(`/api/runners/${encodeURIComponent(name)}/start`, { method: 'POST' }),

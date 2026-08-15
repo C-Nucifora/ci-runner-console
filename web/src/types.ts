@@ -79,3 +79,25 @@ export interface AuditEntry {
   durationMs: number;
   requestId: string;
 }
+
+export interface HealthCheck {
+  id: 'github' | 'runner-vm' | 'oidc';
+  label: string;
+  ok: boolean;
+  detail: string;
+  facts: { label: string; value: string }[];
+}
+
+export interface SettingsRow {
+  label: string;
+  value: string;
+  env?: string;
+  note?: string;
+  mismatch?: boolean;
+}
+
+export interface SettingsGroup {
+  title: string;
+  description?: string;
+  rows: SettingsRow[];
+}

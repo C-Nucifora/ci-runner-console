@@ -1,87 +1,115 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from './api';
-import { AuditList, HeadroomTiles, Notice, StateBadge } from './components';
-import type { AuditEntry, Inventory, Me, RunnerView } from './types';
+import { ATTENTION_STATES } from './components';
+import { RunnersView, type Action } from './RunnersView';
+import { SettingsView } from './SettingsView';
+import type { Inventory, Me } from './types';
 
 const POLL_MS = 15_000;
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 
-const ATTENTION = new Set(['orphan-github', 'orphan-local', 'unregistered', 'no-service', 'disconnected']);
+type Route = 'runners' | 'settings';
+
+interface Toast {
+  id: number;
+  tone: 'good' | 'critical' | 'busy';
+  message: string;
+  hint?: string;
+}
+
+function routeFromPath(path: string): Route {
+  return path.replace(/\/+$/, '') === '/settings' ? 'settings' : 'runners';
+}
 
 export function App() {
+  const [route, setRoute] = useState<Route>(() => routeFromPath(window.location.pathname));
   const [me, setMe] = useState<Me | null>(null);
   const [inventory, setInventory] = useState<Inventory | null>(null);
-  const [audit, setAudit] = useState<AuditEntry[]>([]);
-  const [error, setError] = useState<{ message: string; hint?: string } | null>(null);
-  const [flash, setFlash] = useState<string | null>(null);
+  const [fatal, setFatal] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [logs, setLogs] = useState<{ name: string; lines: string[] } | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
 
-  const refresh = useCallback(async (opts: { quiet?: boolean } = {}) => {
+  const pushToast = useCallback((t: Omit<Toast, 'id'>) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { ...t, id }]);
+    // Failures stay until dismissed; successes are transient.
+    if (t.tone !== 'critical') {
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 6000);
+    }
+  }, []);
+
+  const navigate = useCallback((next: Route) => {
+    setRoute(next);
+    window.history.pushState({}, '', next === 'settings' ? '/settings' : '/');
+  }, []);
+
+  useEffect(() => {
+    const onPop = () => setRoute(routeFromPath(window.location.pathname));
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  const refresh = useCallback(async () => {
     try {
-      const [inv, aud] = await Promise.all([api.inventory(), api.audit(25)]);
-      setInventory(inv);
-      setAudit(aud.entries);
-      if (!opts.quiet) setError(null);
+      setInventory(await api.inventory());
+      setFatal(null);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
-      setError({
-        message: err instanceof Error ? err.message : String(err),
-        hint: err instanceof ApiError ? err.hint : undefined,
-      });
+      setFatal(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   useEffect(() => {
     api.me().then(setMe).catch(() => undefined);
     void refresh();
-    const timer = setInterval(() => void refresh({ quiet: true }), POLL_MS);
+    const timer = setInterval(() => void refresh(), POLL_MS);
     return () => clearInterval(timer);
   }, [refresh]);
 
-  /** Wraps a mutation so the button disables, errors surface, and state re-reads. */
+  /** Runs a mutation, reports it as a toast, and re-reads state either way. */
   const run = useCallback(
     async (key: string, fn: () => Promise<unknown>, success: string) => {
       setBusy(key);
-      setError(null);
-      setFlash(null);
       try {
         await fn();
-        setFlash(success);
-        await refresh();
+        pushToast({ tone: 'good', message: success });
       } catch (err) {
-        setError({
+        pushToast({
+          tone: 'critical',
           message: err instanceof Error ? err.message : String(err),
           hint: err instanceof ApiError ? err.hint : undefined,
         });
       } finally {
         setBusy(null);
+        await refresh();
       }
     },
-    [refresh],
+    [pushToast, refresh],
   );
 
-  const showLogs = useCallback(async (name: string) => {
-    setBusy(`logs:${name}`);
-    try {
-      const { lines } = await api.logs(name);
-      setLogs({ name, lines });
-    } catch (err) {
-      setError({ message: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(null);
-    }
-  }, []);
+  const attentionCount =
+    inventory?.runners.filter((r) => !r.protectedRunner && ATTENTION_STATES.includes(r.state)).length ?? 0;
 
   return (
-    <div className="shell">
+    <>
       <header className="topbar">
-        <h1>CI Runners</h1>
-        {me ? (
-          <div className="who">
-            <span>
-              Signed in as <strong>{me.user.name || me.user.username}</strong>
-            </span>
+        <div className="topbar-inner">
+          <span className="brand">
+            <span className="mark" data-degraded={attentionCount > 0 || Boolean(fatal)} />
+            CI Runners
+          </span>
+          {inventory ? <span className="target-chip">{inventory.target}</span> : null}
+
+          <nav className="nav" aria-label="Sections">
+            <button onClick={() => navigate('runners')} aria-current={route === 'runners' ? 'page' : undefined}>
+              Runners
+            </button>
+            <button onClick={() => navigate('settings')} aria-current={route === 'settings' ? 'page' : undefined}>
+              Settings
+            </button>
+          </nav>
+
+          <div className="whoami">
+            <span>{me?.user.name || me?.user.username || '…'}</span>
             <button
               className="link"
               onClick={async () => {
@@ -92,49 +120,36 @@ export function App() {
               Sign out
             </button>
           </div>
-        ) : null}
+        </div>
       </header>
 
-      <p className="subtitle">
-        Self-hosted runner instances on the CI VM, managing{' '}
-        <code>{inventory?.target ?? me?.target ?? '…'}</code>. Each instance runs one job at a time.
-      </p>
+      <main>
+        {fatal ? (
+          <div className="banner" data-tone="critical" role="alert">
+            <span className="glyph" aria-hidden="true">
+              ✕
+            </span>
+            <div className="body">
+              <div>
+                <strong>Cannot load runner state</strong>
+              </div>
+              <div className="hint">{fatal}</div>
+            </div>
+            <div style={{ marginLeft: 'auto' }}>
+              <button className="btn" onClick={() => void refresh()}>
+                Retry
+              </button>
+            </div>
+          </div>
+        ) : null}
 
-      {error ? (
-        <Notice tone="error" hint={error.hint}>
-          {error.message}
-        </Notice>
-      ) : null}
-      {flash ? <Notice tone="success">{flash}</Notice> : null}
-      {inventory?.warnings.map((w) => (
-        <Notice key={w} tone="warning">
-          {w}
-        </Notice>
-      ))}
-
-      {inventory ? (
-        <section>
-          <h2>VM headroom</h2>
-          <HeadroomTiles
-            headroom={inventory.headroom}
-            cap={inventory.cap}
-            runners={inventory.runners}
-          />
-        </section>
-      ) : null}
-
-      <section>
-        <h2>Runners</h2>
-        <div className="card">
-          <RunnerTable
+        {route === 'runners' ? (
+          <RunnersView
             inventory={inventory}
+            me={me}
             busy={busy}
-            onAction={(name, action) =>
-              run(
-                `${action}:${name}`,
-                () => api[action](name),
-                `${name} ${action === 'stop' ? 'stopped' : `${action}ed`}.`,
-              )
+            onAction={(name, action: Action) =>
+              run(`${action}:${name}`, () => api[action](name), `${name} ${pastTense(action)}.`)
             }
             onDelete={(name) =>
               run(
@@ -143,20 +158,8 @@ export function App() {
                 `${name} removed from the VM and deregistered from GitHub.`,
               )
             }
-            onLogs={showLogs}
-          />
-        </div>
-      </section>
-
-      <section>
-        <h2>Add a runner</h2>
-        <div className="card">
-          <AddRunnerForm
-            inventory={inventory}
-            defaultLabels={me?.defaultLabels ?? []}
-            busy={busy === 'create'}
-            onCreate={(name, labels) =>
-              run(
+            onCreate={async (name, labels) => {
+              await run(
                 'create',
                 async () => {
                   const res = await api.create(name, labels);
@@ -168,263 +171,36 @@ export function App() {
                   }
                 },
                 `${name} is registered and online in GitHub.`,
-              )
-            }
-          />
-        </div>
-      </section>
-
-      <section>
-        <h2>Audit log</h2>
-        <div className="card">
-          <AuditList entries={audit} />
-        </div>
-      </section>
-
-      {logs ? <LogDialog name={logs.name} lines={logs.lines} onClose={() => setLogs(null)} /> : null}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ table */
-
-function RunnerTable({
-  inventory,
-  busy,
-  onAction,
-  onDelete,
-  onLogs,
-}: {
-  inventory: Inventory | null;
-  busy: string | null;
-  onAction: (name: string, action: 'start' | 'stop' | 'restart') => void;
-  onDelete: (name: string) => void;
-  onLogs: (name: string) => void;
-}) {
-  if (!inventory) return <div className="empty">Loading…</div>;
-  if (inventory.runners.length === 0) {
-    return <div className="empty">No runners yet. Add one below.</div>;
-  }
-
-  return (
-    <table>
-      <thead>
-        <tr>
-          <th>Runner</th>
-          <th>State</th>
-          <th>Labels</th>
-          <th>Service</th>
-          <th style={{ textAlign: 'right' }}>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {inventory.runners.map((r) => (
-          <RunnerRow
-            key={r.name}
-            runner={r}
-            busy={busy}
-            onAction={onAction}
-            onDelete={onDelete}
-            onLogs={onLogs}
-          />
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function RunnerRow({
-  runner: r,
-  busy,
-  onAction,
-  onDelete,
-  onLogs,
-}: {
-  runner: RunnerView;
-  busy: string | null;
-  onAction: (name: string, action: 'start' | 'stop' | 'restart') => void;
-  onDelete: (name: string) => void;
-  onLogs: (name: string) => void;
-}) {
-  const anyBusy = busy !== null;
-  return (
-    <tr className={ATTENTION.has(r.state) ? 'attention' : undefined}>
-      <td>
-        <div className="runner-name">
-          {r.name}
-          {r.protectedRunner ? <span className="chip">protected</span> : null}
-        </div>
-        <div className="runner-detail">{r.detail}</div>
-      </td>
-      <td>
-        <StateBadge state={r.state} />
-      </td>
-      <td>
-        <div className="labels">
-          {(r.github?.labels ?? []).map((l) => (
-            <span className="chip" key={l}>
-              {l}
-            </span>
-          ))}
-          {!r.github ? <span className="mono">—</span> : null}
-        </div>
-      </td>
-      <td>
-        <div className="mono">{r.local?.unit ?? 'no unit'}</div>
-        <div className="mono">
-          {r.local ? `${r.local.active ?? 'unknown'} · ${r.local.enabled ?? 'not enabled'}` : 'not on this VM'}
-        </div>
-      </td>
-      <td>
-        {r.protectedRunner ? (
-          // Four disabled buttons say less than one sentence, and they wrap the
-          // column onto three ragged lines.
-          <div className="actions">
-            <span className="mono">not managed here</span>
-          </div>
-        ) : (
-        <div className="actions">
-          {r.local?.unit ? (
-            <button onClick={() => onLogs(r.name)} disabled={anyBusy}>
-              Logs
-            </button>
-          ) : null}
-          <button onClick={() => onAction(r.name, 'start')} disabled={anyBusy || !r.actions.start}>
-            Start
-          </button>
-          <button onClick={() => onAction(r.name, 'stop')} disabled={anyBusy || !r.actions.stop}>
-            Stop
-          </button>
-          <button onClick={() => onAction(r.name, 'restart')} disabled={anyBusy || !r.actions.restart}>
-            Restart
-          </button>
-          <button
-            className="danger"
-            disabled={anyBusy || !r.actions.delete}
-            onClick={() => {
-              const extra = r.github
-                ? 'It will be stopped, removed from the VM, and deregistered from GitHub.'
-                : 'It will be removed from the VM.';
-              if (window.confirm(`Delete runner "${r.name}"?\n\n${extra}`)) onDelete(r.name);
+              );
             }}
-          >
-            Delete
-          </button>
-        </div>
+          />
+        ) : (
+          <SettingsView me={me} />
         )}
-      </td>
-    </tr>
+      </main>
+
+      <div className="toasts" aria-live="polite">
+        {toasts.map((t) => (
+          <div className="toast" data-tone={t.tone} key={t.id}>
+            <span aria-hidden="true">{t.tone === 'good' ? '✓' : '✕'}</span>
+            <div>
+              <div>{t.message}</div>
+              {t.hint ? <div className="hint">{t.hint}</div> : null}
+            </div>
+            <button
+              className="close"
+              aria-label="Dismiss"
+              onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+    </>
   );
 }
 
-/* ------------------------------------------------------------------- form */
-
-function AddRunnerForm({
-  inventory,
-  defaultLabels,
-  busy,
-  onCreate,
-}: {
-  inventory: Inventory | null;
-  defaultLabels: string[];
-  busy: boolean;
-  onCreate: (name: string, labels: string[]) => void;
-}) {
-  const [name, setName] = useState('');
-  const [labels, setLabels] = useState('');
-
-  const atCap = inventory ? !inventory.cap.canCreate : false;
-  const duplicate = Boolean(inventory?.runners.some((r) => r.name === name));
-  const badName = name.length > 0 && !NAME_RE.test(name);
-
-  let blocker: string | null = null;
-  if (atCap) {
-    blocker = `This VM is at its limit of ${inventory?.cap.limit} runner instances. Delete one before adding another.`;
-  } else if (badName) {
-    blocker = 'Use letters, digits, dot, dash or underscore, starting with a letter or digit.';
-  } else if (duplicate) {
-    blocker = `A runner named ${name} already exists — names must be unique.`;
-  }
-
-  return (
-    <form
-      className="add-runner"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (blocker || !name) return;
-        onCreate(
-          name,
-          labels
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean),
-        );
-        setName('');
-        setLabels('');
-      }}
-    >
-      <div className="field">
-        <label htmlFor="runner-name">Name</label>
-        <input
-          id="runner-name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="ci-runner-2"
-          autoComplete="off"
-          disabled={busy || atCap}
-        />
-        <span className="hint">Must be unique across the target.</span>
-      </div>
-
-      <div className="field">
-        <label htmlFor="runner-labels">Extra labels</label>
-        <input
-          id="runner-labels"
-          value={labels}
-          onChange={(e) => setLabels(e.target.value)}
-          placeholder="comma,separated"
-          autoComplete="off"
-          disabled={busy || atCap}
-        />
-        <span className="hint">
-          {defaultLabels.length > 0
-            ? `Always applied: ${defaultLabels.join(', ')}`
-            : 'self-hosted, Linux and X64 are added automatically.'}
-        </span>
-      </div>
-
-      <button className="primary" type="submit" disabled={busy || atCap || !name || Boolean(blocker)}>
-        {busy ? 'Creating…' : 'Add runner'}
-      </button>
-
-      {busy ? <span className="spin">Registering and waiting for GitHub to report it online…</span> : null}
-      {blocker && !busy ? <span className="spin">{blocker}</span> : null}
-    </form>
-  );
-}
-
-/* ----------------------------------------------------------------- dialog */
-
-function LogDialog({ name, lines, onClose }: { name: string; lines: string[]; onClose: () => void }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    ref.current?.showModal();
-  }, []);
-
-  return (
-    <dialog ref={ref} onClose={onClose} onCancel={onClose}>
-      <h3>{name} — service log</h3>
-      <pre className="logs">{lines.length ? lines.join('\n') : 'No log lines returned.'}</pre>
-      <div className="dialog-actions">
-        <button
-          onClick={() => {
-            ref.current?.close();
-            onClose();
-          }}
-        >
-          Close
-        </button>
-      </div>
-    </dialog>
-  );
+function pastTense(action: Action): string {
+  return action === 'stop' ? 'stopped' : `${action}ed`;
 }

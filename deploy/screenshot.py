@@ -83,12 +83,17 @@ async def capture(session_cookie):
             await cdp.send("Network.setCookie", name="crc_session", value=session_cookie,
                            domain=host, path="/", secure=True, httpOnly=True)
 
-            for mode in ("light", "dark"):
+            for mode, page, label in (
+                ("light", "/", "runners"),
+                ("dark", "/", "runners"),
+                ("light", "/settings", "settings"),
+                ("dark", "/settings", "settings"),
+            ):
                 await cdp.send("Emulation.setEmulatedMedia",
                                features=[{"name": "prefers-color-scheme", "value": mode}])
                 await cdp.send("Emulation.setDeviceMetricsOverride",
                                width=1440, height=1200, deviceScaleFactor=2, mobile=False)
-                await cdp.send("Page.navigate", url=APP + "/")
+                await cdp.send("Page.navigate", url=APP + page)
                 await asyncio.sleep(6)
                 # Grow the viewport to the full document so nothing is cut off.
                 h = await cdp.send(
@@ -106,11 +111,11 @@ async def capture(session_cookie):
                     returnByValue=True)
                 if not mounted["result"]["value"]:
                     raise SystemExit(
-                        f"the app did not render in {mode} mode — check the browser "
+                        f"the app did not render {label} in {mode} mode — check the browser "
                         "console for asset or CSP errors")
 
                 shot = await cdp.send("Page.captureScreenshot", format="png")
-                path = os.path.join(OUT, f"console-{mode}.png")
+                path = os.path.join(OUT, f"{label}-{mode}.png")
                 with open(path, "wb") as f:
                     f.write(base64.b64decode(shot["data"]))
                 print(f"wrote {path} ({full}px tall)")

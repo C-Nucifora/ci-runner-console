@@ -3,11 +3,26 @@ import { z } from 'zod';
 import { AuditLog, audited } from '../audit.js';
 import type { Identity, SessionStore } from '../auth/session.js';
 import type { Config } from '../config.js';
+import type { GitHubCredential } from '../github/credentials.js';
 import { GitHubApiError, type RunnerRegistry } from '../github/registry.js';
+import { hostKeyFingerprint, runHealthChecks } from '../health.js';
 import { buildInventory, type RunnerView } from '../reconcile.js';
 import type { RunnerVmControl } from '../vm/ctl.js';
 import { VmError } from '../vm/ssh.js';
 import { SESSION_COOKIE } from './auth.js';
+
+/** Mirrors the case statement in vm/ci-runner-ctl-ssh. Shown in Settings. */
+const ALLOWLIST = [
+  'list',
+  'headroom',
+  'status',
+  'logs',
+  'start',
+  'stop',
+  'restart',
+  'create',
+  'remove',
+];
 
 /** Mirrors the validation the runner VM applies, so bad input fails here with a clear message. */
 const RUNNER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
@@ -40,11 +55,12 @@ export function registerApiRoutes(
     config: Config;
     sessions: SessionStore;
     registry: RunnerRegistry;
+    credential: GitHubCredential;
     control: RunnerVmControl;
     audit: AuditLog;
   },
 ) {
-  const { config, sessions, registry, control, audit } = deps;
+  const { config, sessions, registry, credential, control, audit } = deps;
 
   function requireIdentity(req: FastifyRequest): Identity {
     const identity = sessions.get(req.cookies[SESSION_COOKIE]);
@@ -109,6 +125,124 @@ export function registerApiRoutes(
     const { limit } = req.query as { limit?: string };
     const parsed = Number.parseInt(limit ?? '100', 10);
     return { entries: await audit.tail(Number.isFinite(parsed) ? Math.min(parsed, 500) : 100) };
+  });
+
+  app.get('/api/health', async (req) => {
+    requireIdentity(req);
+    return { checks: await runHealthChecks({ config, credential, registry, control }) };
+  });
+
+  /**
+   * Effective configuration, for operators to confirm what the running process
+   * actually believes. Every row names the variable that sets it, because the
+   * answer to "why is it doing that" is almost always an environment value.
+   * Secrets are never included — only their shape.
+   */
+  app.get('/api/settings', async (req) => {
+    requireIdentity(req);
+
+    // The VM enforces its own cap independently of the app's. If they disagree the
+    // stricter one silently wins, which is confusing, so surface it.
+    let vmCap: number | null = null;
+    try {
+      vmCap = (await control.headroom()).cap;
+    } catch {
+      vmCap = null;
+    }
+
+    return {
+      groups: [
+        {
+          title: 'GitHub target',
+          description: 'Where runners are registered, and what this console signs in as.',
+          rows: [
+            { label: 'Scope', value: config.github.scope, env: 'GITHUB_SCOPE' },
+            { label: 'Owner', value: config.github.owner, env: 'GITHUB_OWNER' },
+            ...(config.github.repo
+              ? [{ label: 'Repository', value: config.github.repo, env: 'GITHUB_REPO' }]
+              : []),
+            ...(config.github.runnerGroup
+              ? [{ label: 'Runner group', value: config.github.runnerGroup, env: 'GITHUB_RUNNER_GROUP' }]
+              : []),
+            { label: 'Registration URL', value: registry.registrationUrl() },
+            { label: 'Credential', value: credential.describe(), env: 'GITHUB_TOKEN' },
+            { label: 'API base', value: config.github.apiBaseUrl, env: 'GITHUB_API_BASE_URL' },
+          ],
+        },
+        {
+          title: 'Capacity',
+          description:
+            'The cap is enforced twice — here and again on the VM. Keep them in step; the lower value wins.',
+          rows: [
+            { label: 'Console cap', value: String(config.runners.cap), env: 'RUNNER_CAP' },
+            {
+              label: 'VM cap',
+              value: vmCap === null ? 'unavailable' : String(vmCap),
+              note: 'MAX_RUNNERS in /etc/ci-runner-ctl.conf on the runner VM',
+              mismatch: vmCap !== null && vmCap !== config.runners.cap,
+            },
+            {
+              label: 'Default labels',
+              value: config.runners.defaultLabels.join(', ') || 'none',
+              env: 'RUNNER_DEFAULT_LABELS',
+              note: 'Applied to every runner this console creates, on top of GitHub\'s automatic ones.',
+            },
+            {
+              label: 'Protected runners',
+              value: config.runners.protectedNames.join(', ') || 'none',
+              env: 'RUNNER_PROTECTED_NAMES',
+              note: 'Never started, stopped or deleted from here.',
+            },
+          ],
+        },
+        {
+          title: 'Runner VM',
+          description:
+            'Reached over SSH with a key pinned to a fixed command allowlist. No arbitrary shell is possible from this console.',
+          rows: [
+            { label: 'Address', value: `${config.vm.user}@${config.vm.host}:${config.vm.port}`, env: 'RUNNER_VM_HOST' },
+            { label: 'Key file', value: config.vm.privateKeyPath, env: 'RUNNER_VM_KEY_PATH' },
+            {
+              label: 'Pinned host key',
+              value: hostKeyFingerprint(config.vm.hostKey),
+              env: 'RUNNER_VM_HOST_KEY',
+              note: 'Compare with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the VM.',
+            },
+            {
+              label: 'Permitted operations',
+              value: ALLOWLIST.join(', '),
+              note: 'Anything outside this list is refused by the VM, not by this console.',
+            },
+          ],
+        },
+        {
+          title: 'Access',
+          description: 'Sign-in is real OIDC. Proxy-supplied identity headers are stripped and never trusted.',
+          rows: [
+            { label: 'Issuer', value: config.oidc.issuer, env: 'OIDC_ISSUER' },
+            { label: 'Client ID', value: config.oidc.clientId, env: 'OIDC_CLIENT_ID' },
+            {
+              label: 'Permitted groups',
+              value: config.oidc.allowedGroups.join(', ') || 'any authenticated user',
+              env: 'OIDC_ALLOWED_GROUPS',
+            },
+            { label: 'Session lifetime', value: `${Math.round(config.sessionTtlSeconds / 3600)} hours`, env: 'SESSION_TTL_SECONDS' },
+            { label: 'Public base URL', value: config.publicBaseUrl, env: 'PUBLIC_BASE_URL' },
+          ],
+        },
+        {
+          title: 'Audit',
+          rows: [
+            { label: 'Log file', value: config.auditLogPath, env: 'AUDIT_LOG_PATH' },
+            {
+              label: 'Retention',
+              value: 'append-only, no rotation',
+              note: 'Rotate with logrotate if it grows. The console never rewrites this file.',
+            },
+          ],
+        },
+      ],
+    };
   });
 
   app.get('/api/runners/:name/logs', async (req) => {
