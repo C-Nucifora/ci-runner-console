@@ -4,8 +4,8 @@ A web UI for managing self-hosted GitHub Actions runner **instances** on a singl
 dedicated CI VM: see them, start/stop/restart them, add more, and delete them
 cleanly from both sides. Gated behind Authentik SSO.
 
-Live at `https://ci-runners.christiannucifora.com`, served from `dev-box:8080`
-through the existing Cloudflare tunnel.
+Runs as a small Node service behind a reverse proxy or tunnel, either as a
+systemd unit or as a container.
 
 ## What it talks to
 
@@ -67,9 +67,9 @@ Other properties:
 - **Every mutation is audit-logged** against the acting SSO identity, on failure as
   well as success, to an append-only JSONL file.
 - **The control plane does not run on the runner VM**, and nothing on the runner VM
-  can reach it. Note the runner VM has unrestricted LAN and tailnet access (see
-  "Known deviation" in the brief), so this is enforced in the application layer —
-  the network is not doing it for you.
+  can reach it. Do not assume the network enforces this for you: unless you have
+  an egress policy on the runner VM, a job can reach anything the VM can, so keep
+  the isolation in the application and deployment layers where you control it.
 - The service runs as an unprivileged user under a tightly confined systemd unit
   with no capabilities.
 
@@ -105,7 +105,7 @@ Nothing sensitive is in this repository.
 ## Deploying
 
 ```bash
-deploy/deploy.sh dev-box
+deploy/deploy.sh <host>
 ```
 
 Builds locally, ships only runtime dependencies, installs the systemd unit, and
