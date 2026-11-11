@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm, stat, symlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AuditLog, AuditWriteError, audited, type AuditEntry } from '../src/audit.js';
@@ -44,6 +44,11 @@ test('audit redaction, concurrent JSONL writes, bounds and file permissions', as
     await assert.rejects(audited(new AuditLog(dir), { identity, action: 'test', requestId: 'test' }, async () => { started = true; }),
       (err) => err instanceof AuditWriteError && err.operationState === 'not-started');
     assert.equal(started, false);
+    const unterminated = JSON.stringify(entry);
+    await writeFile(path, unterminated);
+    await log.record({ ...entry, requestId: 'after-complete-row' });
+    assert.ok((await readFile(path, 'utf8')).startsWith(unterminated + '\n'));
+    assert.deepEqual((await log.tail()).map(row => row.requestId), ['after-complete-row', 'test']);
     await writeFile(path, 'x'.repeat(2 * 1024 * 1024) + '\n' + JSON.stringify(entry) + '\n' + '{"partial":');
     assert.equal((await log.tail()).length, 1);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -96,4 +101,76 @@ test('intent is durable before side effects and remains visible without an outco
     assert.deepEqual((await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line).outcome),
       ['pending', 'pending', 'success']);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('torn audit boundary failures prevent side effects and allow a durable retry', async t => {
+  for (const phase of ['read', 'separator', 'intent-before', 'intent', 'sync'] as const) {
+    await t.test(phase, async t => {
+      const dir = await mkdtemp(join(tmpdir(), 'audit-torn-'));
+      const path = join(dir, 'audit.jsonl');
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const prior = JSON.stringify(entry) + '\n{"torn":';
+      await writeFile(path, prior);
+      const handle = await open(path, 'r');
+      const prototype = Object.getPrototypeOf(handle) as FileHandle;
+      await handle.close();
+      const originalWrite = prototype.writeFile;
+      const originalSync = prototype.sync;
+      let syncs = 0;
+      const mock = phase === 'read'
+        ? t.mock.method(prototype, 'read', async () => { throw new Error('synthetic read failure'); })
+        : phase === 'sync'
+          ? t.mock.method(prototype, 'sync', async function (this: FileHandle) {
+            if (++syncs === 2) throw new Error('synthetic fsync failure');
+            return originalSync.call(this);
+          })
+          : t.mock.method(prototype, 'writeFile', async function (this: FileHandle,
+            data: Parameters<FileHandle['writeFile']>[0], options?: Parameters<FileHandle['writeFile']>[1]) {
+            if (phase === 'separator' && data === '\n') throw new Error('synthetic repair failure');
+            if (phase === 'intent-before' && typeof data === 'string' && data.length > 1) throw new Error('synthetic interruption after repair');
+            if (phase === 'intent' && typeof data === 'string' && data.length > 1) {
+              await originalWrite.call(this, data.slice(0, 50));
+              throw new Error('synthetic partial write');
+            }
+            return originalWrite.call(this, data, options);
+          });
+      const log = new AuditLog(path);
+      let effects = 0;
+      try {
+        await assert.rejects(audited(log, { identity, action: 'runner.start', requestId: 'failed' }, async () => { effects++; }),
+          err => err instanceof AuditWriteError && err.operationState === 'not-started');
+        assert.equal(effects, 0);
+      } finally { mock.mock.restore(); }
+      const interrupted = await readFile(path, 'utf8');
+      assert.ok(interrupted.startsWith(prior));
+      await audited(log, { identity, action: 'runner.start', requestId: 'retry' }, async () => {
+        assert.ok((await new AuditLog(path).tail()).some(row => row.requestId === 'retry' && row.outcome === 'pending'));
+        effects++;
+      });
+      assert.equal(effects, 1);
+      assert.ok((await readFile(path, 'utf8')).startsWith(interrupted));
+      assert.equal((await log.tail())[0]!.requestId, 'retry');
+    });
+  }
+});
+
+test('concurrent intents after a torn line remain independently readable', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'audit-torn-concurrent-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'audit.jsonl');
+  const prior = JSON.stringify(entry) + '\n{"torn":';
+  await writeFile(path, prior);
+  const log = new AuditLog(path);
+  await Promise.all(Array.from({ length: 8 }, (_, i) => {
+    const requestId = `concurrent-${i}`;
+    return audited(log, { identity, action: 'runner.start', requestId }, async () => {
+      assert.ok((await new AuditLog(path).tail()).some(row => row.requestId === requestId && row.outcome === 'pending'));
+    });
+  }));
+  const raw = await readFile(path, 'utf8');
+  assert.ok(raw.startsWith(prior + '\n'));
+  const rows = raw.slice(prior.length + 1).trim().split('\n').map(line => JSON.parse(line) as AuditEntry);
+  assert.equal(rows.filter(row => row.outcome === 'pending').length, 8);
+  assert.equal(rows.filter(row => row.outcome === 'success').length, 8);
+  assert.equal((await log.tail()).length, 9);
 });

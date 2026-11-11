@@ -2,6 +2,7 @@ import { mkdir, open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import type { Identity } from './auth/session.js';
 
 export interface AuditEntry {
@@ -16,6 +17,19 @@ export interface AuditEntry {
   durationMs: number;
   requestId: string;
 }
+
+const auditEntrySchema = z.object({
+  at: z.iso.datetime({ offset: true }),
+  actor: z.object({ sub: z.string().min(1), username: z.string(), email: z.string().nullable() }),
+  action: z.string().min(1),
+  target: z.string().nullable(),
+  params: z.record(z.string(), z.unknown()),
+  outcome: z.enum(['pending', 'success', 'failure']),
+  operationId: z.string().min(1).optional(),
+  error: z.string().optional(),
+  durationMs: z.number().nonnegative(),
+  requestId: z.string(),
+});
 
 export class AuditWriteError extends Error {
   constructor(readonly operationState: 'not-started' | 'completed' | 'failed') {
@@ -59,10 +73,18 @@ export class AuditLog {
     this.#pendingWrites++;
     const write = this.#writes.then(async () => {
       await this.#ensureDir();
-      const handle = await open(this.path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+      const handle = await open(this.path, constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
       try {
-        if (!(await handle.stat()).isFile()) throw new Error('Audit path is not a regular file');
+        const info = await handle.stat();
+        if (!info.isFile()) throw new Error('Audit path is not a regular file');
         await handle.chmod(0o600);
+        if (content && info.size > 0) {
+          const last = Buffer.alloc(1);
+          const { bytesRead } = await handle.read(last, 0, 1, info.size - 1);
+          if (bytesRead !== 1) throw new Error('Audit boundary could not be read');
+          // Preserve torn bytes while giving this intent its own JSONL boundary.
+          if (last[0] !== 0x0a) await handle.writeFile('\n');
+        }
         await handle.writeFile(content);
         await handle.sync();
       } finally {
@@ -104,7 +126,12 @@ export class AuditLog {
       for (const line of text.split('\n')) {
         if (!line.trim()) continue;
         try {
-          entries.push(JSON.parse(line) as AuditEntry);
+          const parsed = auditEntrySchema.safeParse(JSON.parse(line));
+          if (!parsed.success) continue;
+          const entry = parsed.data;
+          entry.params = redactParams(entry.params);
+          if (entry.error !== undefined) entry.error = 'Operation failed';
+          entries.push(entry);
         } catch {
           /* skip a torn line rather than failing the whole view */
         }

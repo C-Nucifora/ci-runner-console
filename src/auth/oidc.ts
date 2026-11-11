@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
 import type { Identity } from './session.js';
+import { boundedFetch } from '../http.js';
 
 interface ProviderMetadata {
   issuer: string;
@@ -45,7 +46,7 @@ export class OidcClient {
     }
     const base = this.cfg.issuer.replace(/\/+$/, '');
     const url = `${base}/.well-known/openid-configuration`;
-    const res = await fetch(url, { headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+    const res = await boundedFetch(url, { headers: { accept: 'application/json' } });
     if (!res.ok) {
       throw new OidcError(`OIDC discovery failed at ${url}: HTTP ${res.status}`);
     }
@@ -61,7 +62,7 @@ export class OidcClient {
       }
     }
     this.#metadata = meta;
-    this.#jwks = createRemoteJWKSet(new URL(meta.jwks_uri));
+    this.#jwks = createRemoteJWKSet(new URL(meta.jwks_uri), { [customFetch]: boundedFetch });
     return meta;
   }
 
@@ -103,10 +104,8 @@ export class OidcClient {
       code_verifier: verifier,
     });
 
-    const res = await fetch(meta.token_endpoint, {
+    const res = await boundedFetch(meta.token_endpoint, {
       method: 'POST',
-      redirect: 'error',
-      signal: AbortSignal.timeout(10_000),
       headers: {
         'content-type': 'application/x-www-form-urlencoded',
         accept: 'application/json',

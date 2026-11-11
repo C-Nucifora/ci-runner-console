@@ -3,7 +3,8 @@ import { Octokit } from '@octokit/rest';
 import { RequestError } from '@octokit/request-error';
 import type { Config } from './config.js';
 import type { GitHubCredential } from './github/credentials.js';
-import { boundedFetch, type RunnerRegistry } from './github/registry.js';
+import type { RunnerRegistry } from './github/registry.js';
+import { boundedFetch } from './http.js';
 import type { RunnerVmControl } from './vm/ctl.js';
 
 export interface HealthCheck {
@@ -148,10 +149,8 @@ async function checkOidc({ config }: { config: Config }): Promise<HealthCheck> {
 
   try {
     const base = config.oidc.issuer.replace(/\/+$/, '');
-    const res = await fetch(`${base}/.well-known/openid-configuration`, {
+    const res = await boundedFetch(`${base}/.well-known/openid-configuration`, {
       headers: { accept: 'application/json' },
-      redirect: 'error',
-      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) throw new Error(`discovery returned HTTP ${res.status}`);
     const meta = (await res.json()) as { issuer?: string; jwks_uri?: string };
@@ -162,7 +161,7 @@ async function checkOidc({ config }: { config: Config }): Promise<HealthCheck> {
       throw new Error('JWKS must use the configured issuer origin without credentials');
     }
 
-    const jwks = await fetch(keyUrl, { signal: AbortSignal.timeout(10_000), redirect: 'error' });
+    const jwks = await boundedFetch(keyUrl);
     if (!jwks.ok) throw new Error(`JWKS returned HTTP ${jwks.status}`);
     const keys = (await jwks.json()) as { keys?: unknown[] };
     const count = Array.isArray(keys?.keys) ? keys.keys.length : 0;
