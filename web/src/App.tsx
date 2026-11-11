@@ -25,6 +25,7 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
 
@@ -72,15 +73,18 @@ export function App() {
       try {
         await fn();
         pushToast({ tone: 'good', message: success });
+        return null;
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         pushToast({
           tone: 'critical',
-          message: err instanceof Error ? err.message : String(err),
+          message,
           hint: err instanceof ApiError ? err.hint : undefined,
         });
+        return err instanceof ApiError && err.hint ? `${message} ${err.hint}` : message;
       } finally {
-        setBusy(null);
         await refresh();
+        setBusy(null);
       }
     },
     [pushToast, refresh],
@@ -112,12 +116,19 @@ export function App() {
             <span>{me?.user.name || me?.user.username || '…'}</span>
             <button
               className="link"
+              disabled={signingOut || busy !== null}
               onClick={async () => {
-                const { endSessionUrl } = await api.logout();
-                window.location.href = endSessionUrl ?? '/';
+                setSigningOut(true);
+                try {
+                  const { endSessionUrl } = await api.logout();
+                  window.location.href = endSessionUrl ?? '/';
+                } catch (err) {
+                  pushToast({ tone: 'critical', message: err instanceof Error ? err.message : String(err) });
+                  setSigningOut(false);
+                }
               }}
             >
-              Sign out
+              {signingOut ? 'Signing out…' : 'Sign out'}
             </button>
           </div>
         </div>
@@ -148,6 +159,7 @@ export function App() {
             inventory={inventory}
             me={me}
             busy={busy}
+            unavailable={Boolean(fatal) || signingOut}
             onAction={(name, action: Action) =>
               run(`${action}:${name}`, () => api[action](name), `${name} ${pastTense(action)}.`)
             }
@@ -159,7 +171,7 @@ export function App() {
               )
             }
             onCreate={async (name, labels) => {
-              await run(
+              return run(
                 'create',
                 async () => {
                   const res = await api.create(name, labels);
