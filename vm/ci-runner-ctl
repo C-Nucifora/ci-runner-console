@@ -90,7 +90,7 @@ configure() {
 # Echoes "dir<TAB>name<TAB>unit" for each runner instance present on this VM.
 # Count managed directories even after a failed unpack or runner-owned file deletion.
 enumerate() {
-  local d name unit
+  local d name unit status
   for d in "$LEGACY_DIR" "$RUNNERS_DIR"/*; do
     safe_dir "$d" || continue
     [[ $d != "$LEGACY_DIR" || -x $d/config.sh && ! -L $d/config.sh ]] || continue
@@ -107,7 +107,12 @@ except Exception:
     valid_name "$name" && [[ $name != *..* ]] || name=$(basename "$d")
     valid_name "$name" && [[ $name != *..* ]] || continue
     unit=''
-    unit=$(unit_for "$d" || true)
+    if unit=$(unit_for "$d"); then
+      :
+    else
+      status=$?
+      [[ ${1:-} != strict || $status == 1 ]] || return 2
+    fi
     printf '%s\t%s\t%s\n' "$d" "$name" "$unit"
   done
 }
@@ -123,40 +128,71 @@ dir_for() {
 unit_for() {
   local d=$1
   local unit=actions.runner.console.${d##*/}.service
-  if [[ ! -f /etc/systemd/system/$unit ]]; then
-    [[ -f $d/.service && ! -L $d/.service && $(stat -c %s "$d/.service") -le 255 ]] || return 1
-    unit=$(python3 -c '
+  if [[ ! -e /etc/systemd/system/$unit && ! -L /etc/systemd/system/$unit ]]; then
+    unit=''
+    if [[ -e $d/.service || -L $d/.service ]]; then
+      [[ -f $d/.service && ! -L $d/.service && $(stat -c %s "$d/.service") -le 255 ]] || return 2
+      unit=$(python3 -c '
 import os,stat,sys
 fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 with os.fdopen(fd) as f:
     assert stat.S_ISREG(os.fstat(f.fileno()).st_mode)
-    print(f.read(256).rstrip("\n"))' "$d/.service" 2>/dev/null) || return 1
+    print(f.read(256).rstrip("\n"))' "$d/.service" 2>/dev/null) || return 2
+      valid_unit "$unit" || return 2
+    fi
   fi
-  valid_unit "$unit" || return 1
-  # Runner metadata is only a hint. Authority comes from a root-owned unit bound
-  # to this exact directory and unprivileged account.
-  python3 - "$unit" "$d" "$RUNNER_USER" <<'PYUNIT' || return 1
-import os, stat, sys, configparser
-unit, directory, user = sys.argv[1:]
+  # Metadata is only a hint. Discover missing markers from verified unit bindings,
+  # and refuse ambiguous matches or an inventory too large to inspect safely.
+  python3 - "$unit" "$d" "$RUNNER_USER" <<'PYUNIT'
+import os, re, stat, sys, configparser
+hint, directory, user = sys.argv[1:]
+base = "/etc/systemd/system/"
+matches = []
 try:
-    fd = os.open("/etc/systemd/system/" + unit, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd) as f:
-        st = os.fstat(f.fileno())
-        assert stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
-        content = f.read(65537)
-        assert len(content) <= 65536
-        c = configparser.ConfigParser(interpolation=None, strict=True, delimiters=("=",))
-        c.optionxform = str
-        c.read_string(content)
-    assert not c.defaults()
-    assert c["Service"]["WorkingDirectory"] == directory
-    assert c["Service"]["User"] == user
-    assert c["Service"]["ExecStart"] == directory + "/runsvc.sh"
-    assert not os.path.lexists("/etc/systemd/system/" + unit + ".d")
-except Exception:
+    with os.scandir(base) as entries:
+        candidates = []
+        for count, entry in enumerate(entries, 1):
+            if count > 4096:
+                sys.exit(2)
+            if re.fullmatch(r"actions\.runner\.[A-Za-z0-9._-]+\.service", entry.name):
+                candidates.append(entry.name)
+                if len(candidates) > 128:
+                    sys.exit(2)
+except FileNotFoundError:
     sys.exit(1)
+except OSError:
+    sys.exit(2)
+for unit in candidates:
+    bound = False
+    try:
+        fd = os.open(base + unit, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as f:
+            st = os.fstat(f.fileno())
+            assert stat.S_ISREG(st.st_mode)
+            content = f.read(65537)
+            assert len(content) <= 65536
+            c = configparser.ConfigParser(interpolation=None, strict=True, delimiters=("=",))
+            c.optionxform = str
+            c.read_string(content)
+        bound = c["Service"]["WorkingDirectory"] == directory
+        if not bound:
+            assert unit != hint
+            continue
+        assert st.st_uid == 0 and not st.st_mode & 0o022
+        assert not c.defaults()
+        assert c["Service"]["User"] == user
+        assert c["Service"]["ExecStart"] == directory + "/runsvc.sh"
+        assert not os.path.lexists(base + unit + ".d")
+        matches.append(unit)
+    except Exception:
+        # An unreadable/unsupported runner unit could be another binding.
+        sys.exit(2)
+if len(matches) > 1 or hint and matches != [hint]:
+    sys.exit(2)
+if not matches:
+    sys.exit(1)
+print(matches[0], end="")
 PYUNIT
-  printf '%s' "$unit"
 }
 
 # `systemctl is-active` prints the state and *also* exits non-zero for anything
@@ -171,11 +207,13 @@ unit_active() {
 # ---------------------------------------------------------------- subcommands
 
 cmd_list() {
-  local d n u active enabled substate since
+  local d n u active enabled substate since rows
+  rows=$(enumerate strict) || die "service discovery uncertain; inspect runner units before retrying"
   {
     printf '{"ok":true,"instances":['
     local first=1
     while IFS=$'\t' read -r d n u; do
+      [[ -n $d ]] || continue
       [[ $first == 1 ]] || printf ','
       first=0
       active=''; enabled=''; substate=''; since=''
@@ -201,7 +239,7 @@ print(json.dumps({
   "legacy": d == os.environ.get("LEGACY_DIR","/opt/actions-runner"),
 }), end="")
 PY
-    done < <(enumerate)
+    done <<< "$rows"
     printf ']}\n'
   }
 }
@@ -352,19 +390,25 @@ cmd_remove() {
 
   token=$(read_token)
 
-  if ! u=$(unit_for "$d"); then
-    [[ ! -e $d/.service && ! -L $d/.service && ! -e /etc/systemd/system/actions.runner.console.${d##*/}.service && ! -L /etc/systemd/system/actions.runner.console.${d##*/}.service ]] || die "unsafe service metadata; instance retained"
+  if u=$(unit_for "$d"); then
+    :
+  else
+    local discovery_status=$?
+    [[ $discovery_status == 1 && ! -e $d/.service && ! -L $d/.service && ! -e /etc/systemd/system/actions.runner.console.${d##*/}.service && ! -L /etc/systemd/system/actions.runner.console.${d##*/}.service ]] || die "unsafe service metadata; instance retained"
     u=''
   fi
+  # A directory cannot be unlinked as a marker. Refuse before removing trusted evidence.
+  [[ ! -d $d/.service || -L $d/.service ]] || die "unsafe service metadata; instance retained"
   if [[ -n $u ]]; then
     systemctl stop "$u" >&2 || die "service stop failed; instance retained"
     systemctl disable "$u" >&2 || die "service disable failed; instance retained"
     [[ ! -L /etc/systemd/system/$u ]] || die "unsafe service path"
-    rm -f -- "/etc/systemd/system/$u" || die "service uninstall failed; instance retained"
-    # Unlink the marker itself, never follow a runner-owned symlink.
+    # Unlink the marker itself before deleting the trusted retry evidence.
     rm -f -- "$d/.service" || die "service marker cleanup failed; instance retained"
-    systemctl daemon-reload || die "service reload failed; instance retained"
+    rm -f -- "/etc/systemd/system/$u" || die "service uninstall failed; instance retained"
   fi
+  # Repeat even without a unit file: an earlier removal may have failed at reload.
+  systemctl daemon-reload || die "service reload failed; instance retained"
   # The runner refuses deregistration while its service marker exists.
   # Keep registration metadata on failure so a retry can finish cleanup.
   local deregistered=true

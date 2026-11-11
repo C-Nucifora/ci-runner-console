@@ -291,6 +291,8 @@ os.execvp("bash", sys.argv[4:])
         (d / 'config.sh').chmod(0o755)
         (d / '.runner').write_text('{}')
         self.env['FAKE_EXIT'] = '1'
+        # Reload succeeds; only the fake runner configuration fails.
+        self.fake('systemctl', '#!/bin/sh\n[ "$1" = daemon-reload ]\n')
         result = self.run_ctl('remove', 'r')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('deregistration failed', result.stdout)
@@ -318,7 +320,8 @@ os.execvp("bash", sys.argv[4:])
         d.mkdir()
         self.assertEqual(self.run_ctl('remove', 'empty').returncode, 0)
         self.assertFalse(d.exists())
-        self.assertFalse((self.root / 'calls').exists())
+        calls = [json.loads(line)[1:] for line in (self.root / 'calls').read_text().splitlines()]
+        self.assertEqual(calls, [['daemon-reload']])
 
     def test_missing_config_with_registration_is_retained(self):
         self.execute_configure()
