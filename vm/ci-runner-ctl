@@ -8,6 +8,7 @@
 # Output is a single JSON document on stdout. Diagnostics go to stderr.
 
 set -euo pipefail
+umask 022
 
 CONF=/etc/ci-runner-ctl.conf
 RUNNERS_DIR=/opt/runners
@@ -15,9 +16,9 @@ LEGACY_DIR=/opt/actions-runner
 DIST_DIR=/opt/runner-dist
 RUNNER_USER=runner
 
+RUNNER_VERSION=2.336.0
+RUNNER_SHA256=04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d
 MAX_RUNNERS=3
-# shellcheck source=/dev/null
-[[ -r $CONF ]] && source "$CONF"
 
 die() { printf '%s\n' "{\"ok\":false,\"error\":$(json_str "$1")}"; exit "${2:-1}"; }
 
@@ -28,8 +29,8 @@ json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
 # GitHub runner names: letters, digits, dot, dash, underscore. Must start
 # alphanumeric. Bounded length. This is also what makes $RUNNERS_DIR/$name safe.
 valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; }
-valid_labels() { [[ $1 =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]; }
-valid_url() { [[ $1 =~ ^https://github\.com/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]]; }
+valid_labels() { [[ $1 =~ ^[A-Za-z0-9._-]{1,39}(,[A-Za-z0-9._-]{1,39}){0,19}$ ]]; }
+valid_url() { [[ $1 =~ ^https://github\.com/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)?$ ]]; }
 valid_group() { [[ $1 =~ ^[A-Za-z0-9._\ -]{1,64}$ ]]; }
 valid_lines() { [[ $1 =~ ^[0-9]{1,4}$ ]]; }
 
@@ -44,31 +45,69 @@ require_name() {
 # never written to disk by us.
 read_token() {
   local t
-  IFS= read -r t || true
+  IFS= read -r -t 10 -n 257 t || true
   [[ -n ${t:-} ]] || die "expected token on stdin"
   [[ $t =~ ^[A-Za-z0-9._-]{10,255}$ ]] || die "malformed token"
   printf '%s' "$t"
 }
 
+# Bound privileged subprocesses, including descendants left behind by scripts.
+systemctl() { timeout -k 5 30 systemctl "$@"; }
+journalctl() { timeout -k 5 30 journalctl "$@"; }
+
+safe_dir() {
+  [[ -d $1 && ! -L $1 && $(realpath -e -- "$1") == "$1" ]]
+}
+
+trusted_path() {
+  [[ ! -L $1 && $(stat -c %u -- "$1") == "$EUID" ]] &&
+    (( (8#$(stat -c %a -- "$1") & 0022) == 0 ))
+}
+
+if [[ -e $CONF || -L $CONF ]]; then
+  [[ -f $CONF ]] && trusted_path "$CONF" || die "unsafe controller configuration"
+  # shellcheck source=/dev/null
+  source "$CONF"
+fi
+
+# Metadata is runner-writable, so it must never select an arbitrary system unit.
+valid_unit() { [[ $1 =~ ^actions\.runner\.[A-Za-z0-9._-]+\.service$ ]]; }
+
+configure() {
+  local d=$1 token=$2; shift 2
+  # The runner supports VSO_AGENT_INPUT_TOKEN. Keep it out of argv and diagnostics.
+  printf '%s\n' "$token" | timeout -k 5 120 sudo -u "$RUNNER_USER" -H bash -c '
+    IFS= read -r VSO_AGENT_INPUT_TOKEN
+    export VSO_AGENT_INPUT_TOKEN
+    cd -- "$1" || exit
+    shift
+    exec ./config.sh "$@"
+  ' bash "$d" "$@" 9>&- >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------- discovery
 
 # Echoes "dir<TAB>name<TAB>unit" for each runner instance present on this VM.
-# A directory counts as an instance if it has config.sh, whether or not it has
-# been registered — an unregistered directory is a real state worth surfacing.
+# Count managed directories even after a failed unpack or runner-owned file deletion.
 enumerate() {
   local d name unit
   for d in "$LEGACY_DIR" "$RUNNERS_DIR"/*; do
-    [[ -d $d && -x $d/config.sh ]] || continue
+    safe_dir "$d" || continue
+    [[ $d != "$LEGACY_DIR" || -x $d/config.sh && ! -L $d/config.sh ]] || continue
     name=''
-    [[ -r $d/.runner ]] && name=$(python3 -c '
-import json,sys
+    [[ $d == "$LEGACY_DIR" ]] && name=$(python3 -c '
+import json,sys,os,stat
 try:
-    print(json.load(open(sys.argv[1])).get("agentName",""))
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as f:
+        assert stat.S_ISREG(os.fstat(f.fileno()).st_mode)
+        print(json.loads(f.read(65536)).get("agentName",""))
 except Exception:
     print("")' "$d/.runner" 2>/dev/null || true)
-    [[ -z $name ]] && name=$(basename "$d")
+    valid_name "$name" && [[ $name != *..* ]] || name=$(basename "$d")
+    valid_name "$name" && [[ $name != *..* ]] || continue
     unit=''
-    [[ -r $d/.service ]] && unit=$(tr -d '\n\r' < "$d/.service")
+    unit=$(unit_for "$d" || true)
     printf '%s\t%s\t%s\n' "$d" "$name" "$unit"
   done
 }
@@ -83,8 +122,41 @@ dir_for() {
 
 unit_for() {
   local d=$1
-  [[ -r $d/.service ]] || return 1
-  tr -d '\n\r' < "$d/.service"
+  local unit=actions.runner.console.${d##*/}.service
+  if [[ ! -f /etc/systemd/system/$unit ]]; then
+    [[ -f $d/.service && ! -L $d/.service && $(stat -c %s "$d/.service") -le 255 ]] || return 1
+    unit=$(python3 -c '
+import os,stat,sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd) as f:
+    assert stat.S_ISREG(os.fstat(f.fileno()).st_mode)
+    print(f.read(256).rstrip("\n"))' "$d/.service" 2>/dev/null) || return 1
+  fi
+  valid_unit "$unit" || return 1
+  # Runner metadata is only a hint. Authority comes from a root-owned unit bound
+  # to this exact directory and unprivileged account.
+  python3 - "$unit" "$d" "$RUNNER_USER" <<'PYUNIT' || return 1
+import os, stat, sys, configparser
+unit, directory, user = sys.argv[1:]
+try:
+    fd = os.open("/etc/systemd/system/" + unit, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        assert stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+        content = f.read(65537)
+        assert len(content) <= 65536
+        c = configparser.ConfigParser(interpolation=None, strict=True, delimiters=("=",))
+        c.optionxform = str
+        c.read_string(content)
+    assert not c.defaults()
+    assert c["Service"]["WorkingDirectory"] == directory
+    assert c["Service"]["User"] == user
+    assert c["Service"]["ExecStart"] == directory + "/runsvc.sh"
+    assert not os.path.lexists("/etc/systemd/system/" + unit + ".d")
+except Exception:
+    sys.exit(1)
+PYUNIT
+  printf '%s' "$unit"
 }
 
 # `systemctl is-active` prints the state and *also* exits non-zero for anything
@@ -193,8 +265,8 @@ svc_action() {
   systemctl "$action" "$u" >&2 || die "systemctl $action failed for $u"
   # enable/disable alongside start/stop so the state survives a VM reboot.
   case $action in
-    start)   systemctl enable "$u" >&2 2>/dev/null || true ;;
-    stop)    systemctl disable "$u" >&2 2>/dev/null || true ;;
+    start)   systemctl enable "$u" >&2 2>/dev/null || die "service enable failed" ;;
+    stop)    systemctl disable "$u" >&2 2>/dev/null || die "service disable failed" ;;
   esac
   printf '{"ok":true,"name":%s,"unit":%s,"action":%s,"active":%s}\n' \
     "$(json_str "$name")" "$(json_str "$u")" "$(json_str "$action")" \
@@ -216,43 +288,57 @@ cmd_create() {
 
   dir_for "$name" >/dev/null 2>&1 && die "a runner instance named $name already exists"
 
-  local dist
-  dist=$(ls -1 "$DIST_DIR"/actions-runner-linux-x64-*.tar.gz 2>/dev/null | sort -V | tail -1) \
-    || die "no runner distribution staged in $DIST_DIR"
-  [[ -r $dist ]] || die "no runner distribution staged in $DIST_DIR"
+  local dist=$DIST_DIR/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
+  safe_dir "$DIST_DIR" && trusted_path "$DIST_DIR" && [[ -f $dist ]] && trusted_path "$dist" || die "no trusted runner distribution"
+  printf '%s  %s\n' "$RUNNER_SHA256" "$dist" | sha256sum -c - >/dev/null 2>&1 || die "runner distribution checksum mismatch"
 
   local token
   token=$(read_token)
 
   local d=$RUNNERS_DIR/$name
-  mkdir -p "$d"
+  mkdir -- "$d" || die "instance path already exists"
   # Fresh unpack every time. Never copy another instance's directory — .credentials
   # and .runner are per-registration and sharing them corrupts both runners.
-  tar xzf "$dist" -C "$d"
-  chown -R "$RUNNER_USER":"$RUNNER_USER" "$d"
+  if ! timeout -k 5 120 tar xzf "$dist" -C "$d"; then
+    rm -rf -- "$d"
+    die "runner extraction failed"
+  fi
+  chown -hR "$RUNNER_USER":"$RUNNER_USER" "$d" || die "runner ownership failed; instance retained"
 
-  local args=(--unattended --url "$url" --token "$token" --name "$name"
+  local args=(--unattended --url "$url" --name "$name"
               --work _work --replace=false)
   # config.sh rejects an empty --labels value, so omit the flag entirely rather
   # than passing "".
   [[ -n $labels ]] && args+=(--labels "$labels")
   [[ -n $group ]] && args+=(--runnergroup "$group")
 
-  if ! sudo -u "$RUNNER_USER" -H "$d/config.sh" "${args[@]}" >&2; then
-    rm -rf "$d"
-    die "config.sh failed; instance directory removed"
+  if ! configure "$d" "$token" "${args[@]}"; then
+    die "config.sh failed; instance retained for cleanup"
   fi
 
-  if ! ( cd "$d" && ./svc.sh install "$RUNNER_USER" >&2 && ./svc.sh start >&2 ); then
-    # Leave GitHub clean if the service could not be brought up.
-    sudo -u "$RUNNER_USER" -H "$d/config.sh" remove --token "$token" >&2 2>/dev/null || true
-    rm -rf "$d"
-    die "service install/start failed; instance rolled back"
+  # Never execute runner-owned svc.sh as root.
+  local u=actions.runner.console.$name.service
+  local unit_path=/etc/systemd/system/$u
+  [[ ! -e $unit_path && ! -L $unit_path ]] || die "service path already exists"
+  ( set -o noclobber
+    cat > "$unit_path" <<EOF
+[Unit]
+Description=GitHub Actions runner $name
+After=network.target
+[Service]
+User=$RUNNER_USER
+WorkingDirectory=$d
+ExecStart=$d/runsvc.sh
+KillMode=control-group
+TimeoutStopSec=30
+[Install]
+WantedBy=multi-user.target
+EOF
+  ) || die "service creation failed"
+  if ! systemctl daemon-reload || ! systemctl enable --now "$u"; then
+    # Retain registration and files so failure remains visible and retryable.
+    die "service install/start failed; instance retained for cleanup"
   fi
-
-  local u
-  u=$(unit_for "$d" || echo '')
-  [[ -n $u ]] && systemctl enable "$u" >&2 2>/dev/null || true
   printf '{"ok":true,"name":%s,"dir":%s,"unit":%s,"active":%s}\n' \
     "$(json_str "$name")" "$(json_str "$d")" "$(json_str "$u")" \
     "$(json_str "$([[ -n $u ]] && unit_active "$u" || echo unknown)")"
@@ -266,17 +352,25 @@ cmd_remove() {
 
   token=$(read_token)
 
-  u=$(unit_for "$d" || echo '')
-  if [[ -n $u ]]; then
-    systemctl stop "$u" >&2 2>/dev/null || true
-    systemctl disable "$u" >&2 2>/dev/null || true
-    ( cd "$d" && ./svc.sh uninstall >&2 2>/dev/null ) || true
+  if ! u=$(unit_for "$d"); then
+    [[ ! -e $d/.service && ! -L $d/.service && ! -e /etc/systemd/system/actions.runner.console.${d##*/}.service && ! -L /etc/systemd/system/actions.runner.console.${d##*/}.service ]] || die "unsafe service metadata; instance retained"
+    u=''
   fi
-  # Deregister from GitHub before deleting the directory. If this fails the caller
-  # still removes the GitHub side over the API, but doing it here keeps the runner's
-  # own view consistent.
+  if [[ -n $u ]]; then
+    systemctl stop "$u" >&2 || die "service stop failed; instance retained"
+    systemctl disable "$u" >&2 || die "service disable failed; instance retained"
+    [[ ! -L /etc/systemd/system/$u ]] || die "unsafe service path"
+    rm -f -- "/etc/systemd/system/$u" || die "service uninstall failed; instance retained"
+    # Unlink the marker itself, never follow a runner-owned symlink.
+    rm -f -- "$d/.service" || die "service marker cleanup failed; instance retained"
+    systemctl daemon-reload || die "service reload failed; instance retained"
+  fi
+  # The runner refuses deregistration while its service marker exists.
+  # Keep registration metadata on failure so a retry can finish cleanup.
   local deregistered=true
-  sudo -u "$RUNNER_USER" -H "$d/config.sh" remove --token "$token" >&2 || deregistered=false
+  if [[ -e $d/.runner || -L $d/.runner || -e $d/.credentials || -L $d/.credentials ]]; then
+    configure "$d" "$token" remove || die "deregistration failed; instance retained"
+  fi
   rm -rf "$d"
   printf '{"ok":true,"name":%s,"deregisteredLocally":%s}\n' "$(json_str "$name")" "$deregistered"
 }
@@ -286,6 +380,15 @@ cmd_remove() {
 [[ $EUID -eq 0 ]] || die "ci-runner-ctl must run as root"
 [[ $# -ge 1 ]] || die "no subcommand"
 
+[[ $RUNNER_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid runner user"
+runner_uid=$(id -u -- "$RUNNER_USER") || die "runner user does not exist"
+[[ $runner_uid =~ ^[0-9]+$ && $runner_uid -ne 0 ]] || die "runner user must be unprivileged"
+[[ $RUNNER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $RUNNER_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || die "invalid runner distribution pin"
+[[ $MAX_RUNNERS =~ ^[1-9][0-9]{0,3}$ ]] || die "invalid runner cap"
+safe_dir "$RUNNERS_DIR" && trusted_path "$RUNNERS_DIR" || die "unsafe runners directory"
+# Serialize discovery and mutation so cap checks and removals see stable state.
+exec 9>/run/ci-runner-ctl.lock
+flock -w 10 9 || die "another runner operation is in progress"
 sub=$1; shift
 case $sub in
   list)     [[ $# -eq 0 ]] || die "list takes no arguments"; cmd_list ;;
