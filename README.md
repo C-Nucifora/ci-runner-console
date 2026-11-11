@@ -103,7 +103,10 @@ retrying an operation whose response reports partial or completed work.
 Busy checks are best effort. The pinned runner has no atomic drain command, so a
 job can start between the final GitHub check and stop, restart, or removal. Its
 shutdown wrapper can kill a job after 30 seconds. These controls do not guarantee
-uninterrupted jobs; drain scheduling externally before using them.
+uninterrupted jobs. The console keeps these controls available, rechecks GitHub
+busy state before acting, and refuses known busy runners. It does not require an
+external drain. To avoid interrupting jobs, prevent new job assignments and drain
+existing jobs externally before using the controls.
 
 The console allows five minutes for in-flight requests to finish during shutdown.
 The systemd unit allows 330 seconds. Give containers an equivalent stop timeout;
