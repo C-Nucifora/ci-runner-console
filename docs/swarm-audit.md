@@ -26,13 +26,13 @@ Start with two lightweight breakers. Share capacity status at `/home/christian/.
 
 ## Publication inspection
 
-Fetched `origin` before starting; no incoming commits beyond the local baseline. The intended remote is `https://github.com/C-Nucifora/ci-runner-console.git`. GitHub reports only the CI workflow and no repository hooks. The workflow triggers on pushes to `master`, pull requests and manual dispatch; the topic branch `hardening-audit-rounds` does not trigger deployment or this push workflow. Do not claim hosted CI for topic pushes that do not run it. No reliable prior branch push timestamp was available from reflogs or public push events; use the skill's past-day fallback while preserving the five existing signed commits.
+Fetched `origin` before starting; no incoming commits beyond the local baseline. The intended remote is `https://github.com/C-Nucifora/ci-runner-console.git`. GitHub reports only the CI workflow and no repository hooks. The workflow triggers on pushes to `master`, pull requests and manual dispatch; the topic branch `hardening-audit-rounds` is excluded from push jobs. GitHub still validates workflow files on topic pushes and can report invalid workflows as failed runs. Do not claim hosted test execution from that validation alone. No reliable prior branch push timestamp was available from reflogs or public push events; use the skill's past-day fallback while preserving the five existing signed commits.
 
 The parent published the five preserved, verified commits through `3f8c4ec` to `origin/hardening-audit-rounds` on 2026-11-12. This baseline publication is not a new clean round. No PR, merge, release or deployment was created. New round findings and fixes will be published separately after validation.
 
 ## Round 1
 
-Status: checkpoint requested before round completion. Both breakers and fixers have stopped and preserved their work. The independent VM reviewer completed source review but could not acquire the shared test lock. Parent checkpoint verification passed as recorded below. No new rounds or workers will start before the user restarts the goal.
+Status: resumed by the user after the verified checkpoint. Two fresh independent reviewers are challenging the HTTP/audit implementation and the parent VM/state follow-ups. Parent checkpoint checks passed as recorded below. Round one is not independently closed yet.
 
 Results, regression commands, fixes, independent objections and published commit IDs will be recorded as evidence arrives.
 
@@ -74,7 +74,7 @@ Executed under the shared lock with the designated TMPDIR: `node --import tsx --
 
 ## Deferred work
 
-The user requested a checkpoint and pause on 2026-11-12. The three-round minimum and two consecutive clean rounds have not been reached. Round 1 does not yet count as independently closed; rounds 2 and 3 have not started. The following priorities remain deferred until an explicit restart.
+The user requested a checkpoint and pause on 2026-11-12, then explicitly resumed the extended goal. The three-round minimum and two consecutive clean rounds have not been reached. Round 1 does not yet count as independently closed; rounds 2 and 3 have not started. The following priorities remain approved.
 
 
 Round 2 will emphasize cross-request lifecycle, concurrency, partial failures and durable audit/shutdown recovery. Round 3 will emphasize browser/operator sequences, configuration/deployment boundaries and challenges near earlier fixes. Findings may change these priorities, but cannot remove required matrix coverage or substitute old tests for new experiments. Count a clean round only after its fresh independent challenge completes; record any remaining acceptance limits explicitly.
@@ -120,4 +120,12 @@ Topic branch: `hardening-audit-rounds`. Remote: `origin`, `https://github.com/C-
 - `bdd6765`: service uncertainty classification, guidance and browser controls, with state and browser regressions.
 - The following documentation/CI commit records this checkpoint and includes every Python boundary suite in `npm run test:vm`.
 
-Before publication the parent fetched the intended remote and confirmed only the CI workflow, with no repository hooks. CI runs on master pushes, pull requests and manual dispatch, so this topic push does not run hosted CI or deployment. No PR, merge, release or deployment is part of the checkpoint. Remote verification and final commit IDs are included in the handoff.
+Before publication the parent fetched the intended remote and confirmed only the CI workflow, with no repository hooks. CI runs on master pushes, pull requests and manual dispatch, so valid topic pushes do not execute its jobs. GitHub nonetheless validates workflow syntax on topic pushes, as the checkpoint failure below demonstrated. No deployment is configured. No PR, merge, release or deployment is part of the checkpoint. Remote verification and final commit IDs are included in the handoff.
+
+### Resumed workflow correction
+
+The checkpoint push succeeded through `0c88cd9`, with a clean worktree and four verified signatures. GitHub then rejected the workflow before running any jobs: [run 43120526179](https://github.com/C-Nucifora/ci-runner-console/actions/runs/43120526179), line 17, column 15, `Unrecognized named-value: runner`, in the job-level `env` expression `runner.temp`. This corrects the earlier expectation that the branch filter would prevent any reported run.
+
+R1-C01, medium: the checkpoint's new job-level environment used a context unavailable at that scope. Set `TMPDIR` through a step using the standard `RUNNER_TEMP` environment variable and `GITHUB_ENV` instead. Workflow validation uses actionlint 1.7.12, whose downloaded archive was verified against its published SHA-256 digest. Actionlint passed against the corrected workflow, and `git diff --check` passed. This changes only CI temporary-directory setup; no deployment, credentials, branch triggers or action pins change.
+
+The latest user instruction resumes the unfinished rounds. Fresh independent HTTP/audit and VM/state review tasks are running with separate test-file ownership and the shared heavy-job lock. No earlier refused testing subtask is being retried.
