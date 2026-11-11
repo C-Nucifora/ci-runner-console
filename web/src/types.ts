@@ -3,6 +3,8 @@ export type RunnerState =
   | 'busy'
   | 'disconnected'
   | 'stopped'
+  | 'service-changing'
+  | 'service-unknown'
   | 'no-service'
   | 'orphan-github'
   | 'orphan-local'

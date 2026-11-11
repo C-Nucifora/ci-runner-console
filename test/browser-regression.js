@@ -115,6 +115,27 @@ export async function run() {
   check(document.body.textContent.includes('Request failed (503)'), 'health failure reported with retry available');
   button('Runners').click();
   await wait(() => button('Add runner'));
+  const template = f.inventory.runners.find(r => r.name === 'idle-instance');
+  f.inventory.runners.push(...[
+    ['changing-instance', 'service-changing', 'deactivating'],
+    ['unknown-instance', 'service-unknown', null],
+  ].map(([name, state, active]) => ({
+    ...template, name, state,
+    detail: `Service state is ${active ?? 'unknown'}. Refresh before acting.`,
+    local: { ...template.local, active },
+    actions: { start: false, stop: false, restart: false, delete: false },
+  })));
+  f.poll();
+  await wait(() => document.body.textContent.includes('Service unknown'));
+  for (const [name, label] of [['changing-instance', 'Service changing'], ['unknown-instance', 'Service unknown']]) {
+    const card = [...document.querySelectorAll('article.runner')].find(c => c.textContent.includes(name));
+    const badge = card.querySelector('.badge').cloneNode(true);
+    badge.querySelectorAll('[aria-hidden="true"]').forEach(node => node.remove());
+    check(badge.textContent.trim() === label, `${name} has an accurate service badge`);
+    check(card.closest('section').querySelector('h2').textContent === 'Needs attention', `${name} is not grouped as stopped`);
+    check(!['Start', 'Stop', 'Restart', 'Delete'].some(action => button(action, card)), `${name} has no premature mutation controls`);
+  }
+  check(document.querySelector('.summary').textContent.includes('0 stopped'), 'uncertain services do not increase the stopped count');
   check(document.documentElement.scrollWidth <= innerWidth, `runners has no horizontal overflow at ${innerWidth}px`);
   button('Settings').click();
   await wait(() => document.body.textContent.includes('Checks unavailable. Use Re-check to retry.'));

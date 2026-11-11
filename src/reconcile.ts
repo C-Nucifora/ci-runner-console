@@ -16,6 +16,10 @@ export type RunnerState =
   | 'disconnected'
   /** Registered with GitHub, service installed but not running. Deliberate stop. */
   | 'stopped'
+  /** systemd is starting, stopping or reloading the service. */
+  | 'service-changing'
+  /** The service is not in a confirmed running or stopped state. */
+  | 'service-unknown'
   /** Registered with GitHub, present locally, but no systemd unit was ever installed. */
   | 'no-service'
   /** GitHub has a registration with nothing backing it on this VM. */
@@ -64,10 +68,21 @@ const NEEDS_ATTENTION: ReadonlySet<RunnerState> = new Set<RunnerState>([
   'unregistered',
   'no-service',
   'disconnected',
+  'service-changing',
+  'service-unknown',
 ]);
 
 export function needsAttention(state: RunnerState): boolean {
   return NEEDS_ATTENTION.has(state);
+}
+
+function serviceState(active: string | null | undefined): RunnerState {
+  if (active === 'active') return 'disconnected';
+  if (active === 'inactive' || active === 'failed') return 'stopped';
+  if (['activating', 'deactivating', 'reloading', 'refreshing'].includes(active ?? '')) {
+    return 'service-changing';
+  }
+  return 'service-unknown';
 }
 
 function classify(
@@ -81,6 +96,18 @@ function classify(
         'GitHub has a registration for this runner but no matching instance exists on the VM. ' +
         'Deleting it here will remove the stale registration.',
     };
+  }
+
+  if (local?.unit && local.serviceInstalled) {
+    const service = serviceState(local.active);
+    if (service === 'service-changing' || service === 'service-unknown') {
+      return {
+        state: service,
+        detail: service === 'service-changing'
+          ? `Service is ${local.active}. Wait for it to settle and refresh before acting.`
+          : `Service state is ${local.active ?? 'unknown'}. Refresh or inspect the service before acting.`,
+      };
+    }
   }
 
   if (!github && local) {
@@ -112,7 +139,8 @@ function classify(
     // systemd is authoritative for whether the process is running. GitHub's view is
     // eventually consistent and lags a stop by some seconds, so a runner that was
     // deliberately stopped must not flash up as a fault in the meantime.
-    if (local.active !== 'active') {
+    const service = serviceState(local.active);
+    if (service === 'stopped') {
       return {
         state: 'stopped',
         detail:
@@ -199,7 +227,7 @@ export async function buildInventory(
     const view = makeView(name, github, local, opts.protectedNames);
     if (matchingLocals.some((l) => l.legacy)) view.protectedRunner = true;
     if (githubResult.status === 'rejected') {
-      view.state = local?.active === 'active' ? 'disconnected' : 'stopped';
+      view.state = serviceState(local?.active);
       view.detail = 'GitHub state unknown. Local service is ' + (local?.active ?? 'unknown') + '.';
     }
     if (registrations.length > 1) {
@@ -249,6 +277,8 @@ function makeView(
   const isProtected = protectedNames.includes(name) || Boolean(local?.legacy);
   const hasUnit = Boolean(local?.unit && local.serviceInstalled);
   const running = local?.active === 'active';
+  const stopped = serviceState(local?.active) === 'stopped';
+  const settled = !hasUnit || running || stopped;
 
   return {
     name,
@@ -258,11 +288,11 @@ function makeView(
     local,
     protectedRunner: isProtected,
     actions: {
-      start: !isProtected && !github?.busy && hasUnit && !running,
+      start: !isProtected && !github?.busy && hasUnit && stopped,
       stop: !isProtected && !github?.busy && hasUnit && running,
-      restart: !isProtected && !github?.busy && hasUnit,
+      restart: !isProtected && !github?.busy && hasUnit && settled,
       // An orphan on either side must still be deletable — that is how it gets cleaned up.
-      delete: !isProtected && !github?.busy && (Boolean(local) || Boolean(github)),
+      delete: !isProtected && !github?.busy && settled && (Boolean(local) || Boolean(github)),
     },
   };
 }
