@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { Octokit } from '@octokit/rest';
 import { RequestError } from '@octokit/request-error';
 import type { GitHubCredential } from './credentials.js';
@@ -60,9 +61,40 @@ function wrap(err: unknown, action: string): never {
     } else if (err.status === 401) {
       hint = 'The GitHub token is invalid or has expired.';
     }
-    throw new GitHubApiError(`${action} failed: ${err.message}`, err.status, hint);
+    throw new GitHubApiError(`${action} failed`, err.status, hint);
   }
-  throw err;
+  throw new GitHubApiError(`${action} failed`, 502);
+}
+
+// Bound both a single response and a complete paginated inventory.
+const REQUEST_TIMEOUT_MS = 10_000;
+const INVENTORY_TIMEOUT_MS = 30_000;
+const MAX_PAGES = 100;
+const PAGE_SIZE = 100;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+export async function boundedFetch(url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) {
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  const response = await fetch(url, { ...init, signal, redirect: 'error' });
+  const reader = response.body?.getReader();
+  if (!reader) return response;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) throw new Error('GitHub response exceeds size limit');
+      chunks.push(value);
+    }
+  } finally {
+    try { await reader.cancel(); } finally { reader.releaseLock(); }
+  }
+  return new Response(Buffer.concat(chunks), {
+    status: response.status, statusText: response.statusText, headers: response.headers,
+  });
 }
 
 abstract class BaseRegistry implements RunnerRegistry {
@@ -77,6 +109,7 @@ abstract class BaseRegistry implements RunnerRegistry {
       auth: await this.credential.getToken(),
       baseUrl: this.apiBaseUrl,
       userAgent: 'ci-runner-console',
+      request: { fetch: boundedFetch },
     });
   }
 
@@ -87,24 +120,36 @@ abstract class BaseRegistry implements RunnerRegistry {
   abstract registrationUrl(): string;
   abstract describe(): string;
 
-  protected static normalise(raw: {
-    id: number;
-    name: string;
-    os: string;
-    status: string;
-    busy?: boolean;
-    labels: { name: string }[];
-    runner_group_id?: number;
-  }): GitHubRunner {
-    return {
-      id: raw.id,
-      name: raw.name,
-      os: raw.os,
-      status: raw.status === 'online' ? 'online' : 'offline',
-      busy: Boolean(raw.busy),
-      labels: raw.labels.map((l) => l.name),
-      runnerGroupId: raw.runner_group_id,
-    };
+  protected async listPages(route: string, scope: Record<string, string>): Promise<GitHubRunner[]> {
+    const octokit = await this.client();
+    const runner = z.object({
+      id: z.number().int().positive().safe(), name: z.string().min(1).max(256), os: z.string().max(64),
+      status: z.enum(['online', 'offline']), busy: z.boolean(),
+      labels: z.array(z.object({ name: z.string().max(256) })).max(100), runner_group_id: z.number().int().positive().safe().optional(),
+    });
+    const pageSchema = z.object({
+      total_count: z.number().int().nonnegative().max(MAX_PAGES * PAGE_SIZE),
+      runners: z.array(runner).max(PAGE_SIZE),
+    });
+    const result: GitHubRunner[] = [];
+    const ids = new Set<number>();
+    const signal = AbortSignal.timeout(INVENTORY_TIMEOUT_MS);
+    let total: number | undefined;
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const response = await octokit.request(route, { ...scope, per_page: PAGE_SIZE, page, request: { signal } });
+      const data = pageSchema.parse(response.data);
+      total ??= data.total_count;
+      if (data.total_count !== total || data.runners.length !== Math.min(PAGE_SIZE, total - result.length)) {
+        throw new Error('Incomplete or changing runner inventory');
+      }
+      for (const r of data.runners) {
+        if (ids.has(r.id)) throw new Error('Runner pagination repeated an id');
+        ids.add(r.id);
+        result.push({ ...r, labels: r.labels.map((l) => l.name), runnerGroupId: r.runner_group_id });
+      }
+      if (result.length === data.total_count) return result;
+    }
+    throw new Error('Runner inventory exceeds page limit');
   }
 }
 
@@ -120,12 +165,7 @@ export class RepoRunnerRegistry extends BaseRegistry {
 
   async listRunners(): Promise<GitHubRunner[]> {
     try {
-      const octokit = await this.client();
-      const runners = await octokit.paginate(
-        octokit.rest.actions.listSelfHostedRunnersForRepo,
-        { owner: this.owner, repo: this.repo, per_page: 100 },
-      );
-      return runners.map((r) => BaseRegistry.normalise(r));
+      return await this.listPages('GET /repos/{owner}/{repo}/actions/runners', { owner: this.owner, repo: this.repo });
     } catch (err) {
       wrap(err, 'Listing repository runners');
     }
@@ -138,7 +178,8 @@ export class RepoRunnerRegistry extends BaseRegistry {
         owner: this.owner,
         repo: this.repo,
       });
-      return { token: data.token, expiresAt: data.expires_at };
+      const parsed = z.object({ token: z.string().min(1).max(4096).regex(/^[^\s\x00-\x1f\x7f]+$/), expires_at: z.string().datetime({ offset: true }) }).parse(data);
+      return { token: parsed.token, expiresAt: parsed.expires_at };
     } catch (err) {
       wrap(err, 'Creating a registration token');
     }
@@ -151,7 +192,8 @@ export class RepoRunnerRegistry extends BaseRegistry {
         owner: this.owner,
         repo: this.repo,
       });
-      return { token: data.token, expiresAt: data.expires_at };
+      const parsed = z.object({ token: z.string().min(1).max(4096).regex(/^[^\s\x00-\x1f\x7f]+$/), expires_at: z.string().datetime({ offset: true }) }).parse(data);
+      return { token: parsed.token, expiresAt: parsed.expires_at };
     } catch (err) {
       wrap(err, 'Creating a removal token');
     }
@@ -190,12 +232,7 @@ export class OrgRunnerRegistry extends BaseRegistry {
 
   async listRunners(): Promise<GitHubRunner[]> {
     try {
-      const octokit = await this.client();
-      const runners = await octokit.paginate(
-        octokit.rest.actions.listSelfHostedRunnersForOrg,
-        { org: this.org, per_page: 100 },
-      );
-      return runners.map((r) => BaseRegistry.normalise(r));
+      return await this.listPages('GET /orgs/{org}/actions/runners', { org: this.org });
     } catch (err) {
       wrap(err, 'Listing organization runners');
     }
@@ -207,7 +244,8 @@ export class OrgRunnerRegistry extends BaseRegistry {
       const { data } = await octokit.rest.actions.createRegistrationTokenForOrg({
         org: this.org,
       });
-      return { token: data.token, expiresAt: data.expires_at };
+      const parsed = z.object({ token: z.string().min(1).max(4096).regex(/^[^\s\x00-\x1f\x7f]+$/), expires_at: z.string().datetime({ offset: true }) }).parse(data);
+      return { token: parsed.token, expiresAt: parsed.expires_at };
     } catch (err) {
       wrap(err, 'Creating a registration token');
     }
@@ -219,7 +257,8 @@ export class OrgRunnerRegistry extends BaseRegistry {
       const { data } = await octokit.rest.actions.createRemoveTokenForOrg({
         org: this.org,
       });
-      return { token: data.token, expiresAt: data.expires_at };
+      const parsed = z.object({ token: z.string().min(1).max(4096).regex(/^[^\s\x00-\x1f\x7f]+$/), expires_at: z.string().datetime({ offset: true }) }).parse(data);
+      return { token: parsed.token, expiresAt: parsed.expires_at };
     } catch (err) {
       wrap(err, 'Creating a removal token');
     }

@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { AuditLog, audited } from '../audit.js';
+import { AuditLog, AuditWriteError, audited } from '../audit.js';
 import type { Identity, SessionStore } from '../auth/session.js';
 import type { Config } from '../config.js';
 import type { GitHubCredential } from '../github/credentials.js';
@@ -25,7 +25,7 @@ const ALLOWLIST = [
 ];
 
 /** Mirrors the validation the runner VM applies, so bad input fails here with a clear message. */
-const RUNNER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const RUNNER_NAME = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const LABEL = /^[A-Za-z0-9._-]{1,39}$/;
 
 const createRunnerBody = z.object({
@@ -44,6 +44,7 @@ export class HttpError extends Error {
     readonly status: number,
     message: string,
     readonly hint?: string,
+    readonly operationState?: 'not-started' | 'completed' | 'failed',
   ) {
     super(message);
   }
@@ -62,6 +63,56 @@ export function registerApiRoutes(
 ) {
   const { config, sessions, registry, credential, control, audit } = deps;
 
+  // Reject overlapping mutations instead of retaining requests and stale identities.
+  let mutationActive = false;
+  async function mutate<T>(req: FastifyRequest, action: string, target: string | null, operation: () => Promise<T>, params: Record<string, unknown> = {}) {
+    const identity = sessions.get(req.cookies[SESSION_COOKIE]);
+    // Claim the slot before audit I/O so slow storage cannot queue mutations for later execution.
+    const overlapping = mutationActive;
+    if (!overlapping) mutationActive = true;
+    try {
+      return await audited(audit, {
+        identity: identity ?? { sub: 'anonymous', username: 'anonymous', email: null, name: null, groups: [] },
+        action, target, params, requestId: req.id,
+      }, async () => {
+        requireActiveRequest(req);
+        requireSameOrigin(req);
+        if (overlapping) throw new HttpError(409, 'Another runner mutation is in progress. Refresh and retry.');
+        return operation();
+      });
+    } finally {
+      if (!overlapping) mutationActive = false;
+    }
+  }
+
+  function requireActiveRequest(req: FastifyRequest): void {
+    requireIdentity(req);
+    if (req.raw.aborted || req.raw.socket?.destroyed) {
+      throw new HttpError(409, 'Request disconnected before the operation completed.');
+    }
+  }
+
+  async function mutationInventory() {
+    const result = await inventory();
+    if (!result.githubAvailable) {
+      throw new HttpError(503, 'GitHub state is unavailable. Refresh inventory before retrying.');
+    }
+    return result;
+  }
+
+  async function idleRegistrations(req: FastifyRequest, name: string, allowDuplicates = true) {
+    requireActiveRequest(req);
+    const matches = (await registry.listRunners()).filter((runner) => runner.name === name);
+    requireActiveRequest(req);
+    if (matches.some((runner) => runner.busy)) {
+      throw new HttpError(409, `${name} is executing a job. Refresh inventory and retry when idle.`);
+    }
+    if (!allowDuplicates && matches.length > 1) {
+      throw new HttpError(409, `${name} has multiple GitHub registrations. Refresh inventory before cleanup.`);
+    }
+    return matches;
+  }
+
   function requireIdentity(req: FastifyRequest): Identity {
     const identity = sessions.get(req.cookies[SESSION_COOKIE]);
     if (!identity) throw new HttpError(401, 'Not signed in');
@@ -75,7 +126,6 @@ export function registerApiRoutes(
    */
   function requireSameOrigin(req: FastifyRequest): void {
     const origin = req.headers.origin;
-    if (!origin) return; // same-origin fetches from some clients omit it entirely
     if (origin !== config.publicBaseUrl) {
       throw new HttpError(403, 'Cross-origin request refused');
     }
@@ -254,148 +304,124 @@ export function registerApiRoutes(
 
   for (const action of ['start', 'stop', 'restart'] as const) {
     app.post(`/api/runners/:name/${action}`, async (req) => {
-      const identity = requireIdentity(req);
-      requireSameOrigin(req);
       const { name } = req.params as { name: string };
-      if (!RUNNER_NAME.test(name)) throw new HttpError(400, 'Invalid runner name');
-
-      const before = await inventory();
-      const view = findRunner(before.runners, name);
-      if (!view.actions[action]) {
-        throw new HttpError(409, `${name} cannot be ${pastTense(action)} in its current state (${view.state}).`);
-      }
-
-      return audited(
-        audit,
-        { identity, action: `runner.${action}`, target: name, requestId: req.id },
-        async () => {
+      return mutate(req, `runner.${action}`, name, async () => {
+        if (!RUNNER_NAME.test(name)) throw new HttpError(400, 'Invalid runner name');
+        const before = await mutationInventory();
+        const view = findRunner(before.runners, name);
+        if (!view.actions[action]) {
+          throw new HttpError(409, `${name} cannot be ${pastTense(action)} in its current state (${view.state}).`);
+        }
+        await idleRegistrations(req, name, false);
+        try {
           const result = await control[action](name);
           return { ok: true, ...result };
-        },
-      );
+        } catch {
+          throw new HttpError(502, `${name} could not be confirmed ${pastTense(action)}.`,
+            'The VM may have changed. Refresh inventory and check runner logs before retrying.', 'failed');
+        }
+      });
     });
   }
 
   app.post('/api/runners', async (req) => {
-    const identity = requireIdentity(req);
-    requireSameOrigin(req);
-
     const parsed = createRunnerBody.safeParse(req.body);
-    if (!parsed.success) {
-      throw new HttpError(400, parsed.error.issues[0]?.message ?? 'Invalid request');
-    }
-    const { name } = parsed.data;
-    const labels = dedupe([...config.runners.defaultLabels, ...parsed.data.labels]);
-
-    const before = await inventory();
-    if (!before.cap.canCreate) {
-      throw new HttpError(
-        409,
-        `This VM is already at its configured limit of ${before.cap.limit} runner instances.`,
-        'Raise RUNNER_CAP only if the VM has the CPU and memory to back it, or remove an existing runner first.',
-      );
-    }
-    if (before.runners.some((r) => r.name === name)) {
-      throw new HttpError(
-        409,
-        `A runner named ${name} already exists.`,
-        'Runner names must be unique — reusing one would take over the other runner\'s registration.',
-      );
-    }
-
-    return audited(
-      audit,
-      {
-        identity,
-        action: 'runner.create',
-        target: name,
-        // Deliberately records the labels but never the registration token.
-        params: { labels, scope: config.github.scope, target: registry.describe() },
-        requestId: req.id,
-      },
-      async () => {
-        const registration = await registry.createRegistrationToken();
-        const created = await control.create({
-          name,
-          labels,
-          url: registry.registrationUrl(),
-          runnerGroup: config.github.runnerGroup,
+    return mutate(req, 'runner.create', parsed.success ? parsed.data.name : null, async () => {
+      if (!parsed.success) throw new HttpError(400, parsed.error.issues[0]?.message ?? 'Invalid request');
+      const { name } = parsed.data;
+      const labels = dedupe([...config.runners.defaultLabels, ...parsed.data.labels]);
+      if (labels.length > 20) throw new HttpError(400, 'Use at most 20 labels including the configured defaults.');
+      if (config.runners.protectedNames.includes(name)) throw new HttpError(403, 'Runner name is protected');
+      async function checkCreateInventory() {
+        const before = await mutationInventory();
+        requireActiveRequest(req);
+        if (!before.cap.canCreate) {
+          throw new HttpError(409, `Runner capacity is exhausted or unavailable (limit ${before.cap.limit}).`);
+        }
+        if (before.runners.some((r) => r.name === name)) {
+          throw new HttpError(409, `A runner named ${name} already exists.`);
+        }
+      }
+      await checkCreateInventory();
+      const registration = await registry.createRegistrationToken();
+      requireActiveRequest(req);
+      await checkCreateInventory();
+      let created;
+      try {
+        created = await control.create({
+          name, labels, url: registry.registrationUrl(), runnerGroup: config.github.runnerGroup,
           registrationToken: registration.token,
         });
-
-        const online = await waitForGitHub(registry, name, 60_000);
-        return {
-          ok: true,
-          ...created,
-          confirmedInGitHub: Boolean(online),
-          githubStatus: online?.status ?? 'unknown',
-        };
-      },
-    );
+      } catch {
+        throw new HttpError(502, `${name} creation could not be confirmed.`,
+          'Partial local or GitHub state may remain. Refresh inventory and check logs before retrying or cleaning up.', 'failed');
+      }
+      try {
+        const online = await waitForGitHub(registry, name, 60_000, () => requireActiveRequest(req));
+        return { ok: true, ...created, operationState: 'completed',
+          confirmedInGitHub: online?.status === 'online', githubStatus: online?.status ?? 'unknown' };
+      } catch {
+        throw new HttpError(502, `${name} was created on the VM, but GitHub confirmation did not complete.`,
+          'Refresh inventory and check runner logs. Do not create it again or remove it until its state is known.', 'completed');
+      }
+    }, parsed.success ? { labels: dedupe([...config.runners.defaultLabels, ...parsed.data.labels]), scope: config.github.scope, target: registry.describe() } : {});
   });
 
   app.delete('/api/runners/:name', async (req) => {
-    const identity = requireIdentity(req);
-    requireSameOrigin(req);
     const { name } = req.params as { name: string };
-    if (!RUNNER_NAME.test(name)) throw new HttpError(400, 'Invalid runner name');
-
-    const before = await inventory();
-    const view = findRunner(before.runners, name);
-
-    return audited(
-      audit,
-      {
-        identity,
-        action: 'runner.delete',
-        target: name,
-        params: { state: view.state, hadLocal: Boolean(view.local), hadGitHub: Boolean(view.github) },
-        requestId: req.id,
-      },
-      async () => {
-        const steps: string[] = [];
-
-        // Remove the local instance first, using a removal token so the runner
-        // deregisters itself cleanly. If that fails we still force the GitHub side
-        // below, because a half-deleted runner is worse than either extreme.
+    return mutate(req, 'runner.delete', name, async () => {
+      if (!RUNNER_NAME.test(name)) throw new HttpError(400, 'Invalid runner name');
+      const before = await mutationInventory();
+      const view = findRunner(before.runners, name);
+      if (!view.actions.delete) throw new HttpError(409, `${name} cannot be deleted in its current state.`);
+      const steps: string[] = [];
+      let started = false;
+      try {
+        // A local failure stops cleanup; retry from a fresh inventory.
         if (view.local) {
+          await idleRegistrations(req, name);
           const removal = await registry.createRemoveToken();
+          await idleRegistrations(req, name);
+          started = true;
           const result = await control.remove(name, removal.token);
-          steps.push(
-            result.deregisteredLocally
-              ? 'local instance removed and deregistered'
-              : 'local instance removed (self-deregistration failed; forcing via API)',
-          );
+          steps.push(result.deregisteredLocally
+            ? 'local instance removed and deregistered'
+            : 'local instance removed; GitHub deregistration still needs confirmation');
         }
-
-        // Re-read GitHub rather than trusting the pre-action snapshot: config.sh
-        // remove may already have cleared the registration.
-        const remaining = await registry.listRunners().catch(() => null);
-        const stale = remaining?.find((r) => r.name === name) ?? null;
-        if (stale) {
+        const remaining = await idleRegistrations(req, name);
+        for (const stale of remaining) {
+          // Recheck all duplicates before each deletion, including after a slow token or API call.
+          const current = await idleRegistrations(req, name);
+          if (!current.some((runner) => runner.id === stale.id)) continue;
+          started = true;
           await registry.deleteRunner(stale.id);
-          steps.push('GitHub registration deleted');
-        } else if (view.github) {
-          steps.push('GitHub registration already gone');
+          steps.push(`GitHub registration ${stale.id} deleted`);
         }
-
-        // Prove no orphan survived on either side.
-        const after = await inventory().catch(() => null);
-        const leftover = after?.runners.find((r) => r.name === name) ?? null;
-        if (leftover) {
-          throw new Error(
-            `${name} still appears as ${leftover.state} after deletion — manual cleanup needed.`,
-          );
-        }
-
+        const after = await mutationInventory();
+        const leftover = after.runners.find((r) => r.name === name);
+        if (leftover) throw new HttpError(502, `${name} still appears as ${leftover.state}.`);
         return { ok: true, steps };
-      },
-    );
+      } catch (err) {
+        const detail = err instanceof HttpError ? ` ${err.message}` : '';
+        throw new HttpError(err instanceof HttpError ? err.status : 502,
+          `${name} deletion ${started ? 'could not be confirmed' : 'was not started'}.${detail}`,
+          `Refresh inventory and check logs before retrying cleanup. Confirmed steps: ${steps.join('; ') || 'none'}.`,
+          started ? 'failed' : 'not-started');
+      }
+    });
   });
 
   app.setErrorHandler((err, req, reply: FastifyReply) => {
+    if (err instanceof AuditWriteError) {
+      req.log.error({ operationState: err.operationState }, 'runner mutation audit write failed');
+      return reply.code(503).send({ error: err.message, operationState: err.operationState,
+        hint: err.operationState === 'not-started'
+          ? 'Restore audit storage before retrying. No runner action was started.'
+          : 'Restore audit storage and refresh inventory. Check runner logs before retrying; changes may already be applied.',
+      });
+    }
     if (err instanceof HttpError) {
-      return reply.code(err.status).send({ error: err.message, hint: err.hint });
+      return reply.code(err.status).send({ error: err.message, hint: err.hint, operationState: err.operationState });
     }
     if (err instanceof GitHubApiError) {
       req.log.warn({ err: err.message, status: err.status }, 'GitHub API error');
@@ -413,16 +439,18 @@ export function registerApiRoutes(
   });
 }
 
-async function waitForGitHub(registry: RunnerRegistry, name: string, timeoutMs: number) {
+async function waitForGitHub(registry: RunnerRegistry, name: string, timeoutMs: number, checkActive: () => void) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runners = await registry.listRunners().catch(() => []);
-    const found = runners.find((r) => r.name === name);
-    if (found?.status === 'online') return found;
-    await new Promise((r) => setTimeout(r, 3000));
+  while (true) {
+    checkActive();
+    const runners = await registry.listRunners();
+    checkActive();
+    const matches = runners.filter((runner) => runner.name === name);
+    if (matches.length > 1) throw new Error('Multiple GitHub registrations share this name');
+    const found = matches[0];
+    if (found?.status === 'online' || Date.now() >= deadline) return found ?? null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(3000, deadline - Date.now())));
   }
-  const runners = await registry.listRunners().catch(() => []);
-  return runners.find((r) => r.name === name) ?? null;
 }
 
 function dedupe(values: string[]): string[] {
