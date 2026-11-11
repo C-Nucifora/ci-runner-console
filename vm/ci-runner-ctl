@@ -92,8 +92,14 @@ configure() {
 enumerate() {
   local d name unit status
   for d in "$LEGACY_DIR" "$RUNNERS_DIR"/*; do
-    safe_dir "$d" || continue
+    [[ -d $d && ! -L $d ]] || continue
     [[ $d != "$LEGACY_DIR" || -x $d/config.sh && ! -L $d/config.sh ]] || continue
+    # Capacity must not disappear when path or service inspection fails.
+    if [[ ${1:-} == count ]]; then
+      printf '.\n'
+      continue
+    fi
+    safe_dir "$d" || return 2
     name=''
     [[ $d == "$LEGACY_DIR" ]] && name=$(python3 -c '
 import json,sys,os,stat
@@ -118,10 +124,11 @@ except Exception:
 }
 
 dir_for() {
-  local want=$1 d n u
+  local want=$1 d n u rows
+  rows=$(enumerate) || return 2
   while IFS=$'\t' read -r d n u; do
     [[ $n == "$want" ]] && { printf '%s' "$d"; return 0; }
-  done < <(enumerate)
+  done <<< "$rows"
   return 1
 }
 
@@ -246,7 +253,7 @@ PY
 
 cmd_headroom() {
   local count
-  count=$(enumerate | wc -l)
+  count=$(enumerate count | wc -l)
   python3 - "$count" "$MAX_RUNNERS" <<'PY'
 import json,os,sys,shutil
 count,cap = int(sys.argv[1]), int(sys.argv[2])
@@ -270,10 +277,15 @@ PY
 }
 
 cmd_status() {
-  local name=$1 d u
+  local name=$1 d u status
   require_name "$name"
   d=$(dir_for "$name") || die "no such runner instance: $name"
-  u=$(unit_for "$d" || true)
+  if u=$(unit_for "$d"); then
+    :
+  else
+    status=$?
+    [[ $status == 1 ]] || die "service discovery uncertain; inspect runner units before retrying"
+  fi
   python3 - "$d" "$name" "$u" \
     "$([[ -n $u ]] && systemctl is-active "$u" 2>/dev/null || true)" \
     "$([[ -n $u ]] && systemctl is-enabled "$u" 2>/dev/null || true)" <<'PY'
@@ -321,10 +333,14 @@ cmd_create() {
   [[ -z $group ]] || valid_group "$group" || die "invalid runner group"
 
   local count
-  count=$(enumerate | wc -l)
+  count=$(enumerate count | wc -l)
   (( count < MAX_RUNNERS )) || die "runner cap reached ($count/$MAX_RUNNERS)"
 
-  dir_for "$name" >/dev/null 2>&1 && die "a runner instance named $name already exists"
+  if dir_for "$name" >/dev/null 2>&1; then
+    die "a runner instance named $name already exists"
+  else
+    [[ $? == 1 ]] || die "instance discovery uncertain; inspect runner directories before retrying"
+  fi
 
   local dist=$DIST_DIR/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
   safe_dir "$DIST_DIR" && trusted_path "$DIST_DIR" && [[ -f $dist ]] && trusted_path "$dist" || die "no trusted runner distribution"
