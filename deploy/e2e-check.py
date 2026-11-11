@@ -8,26 +8,31 @@ lifecycle: inventory, add, control, delete, cap enforcement and audit logging.
 The temporary user is created in the access group at the start and deleted at the
 end, so no lasting credential is introduced.
 
-Env: AUTHENTIK_URL, AUTHENTIK_TOKEN, APP_URL
+Env: AUTHENTIK_URL, AUTHENTIK_TOKEN, APP_URL, GITHUB_TOKEN, GITHUB_RUNNERS_URL
 """
 import json
 import secrets
 import os
-import ssl
 import sys
 import time
 import urllib.parse
 
 import requests
-import urllib3
+if os.environ.get("ALLOW_LIVE_CHECKS") != "1":
+    raise SystemExit("set ALLOW_LIVE_CHECKS=1 to modify live runners and Authentik")
 
-urllib3.disable_warnings()
+if os.environ.get("REBOOT_TEST") == "1":
+    raise SystemExit("REBOOT_TEST=1 is unsupported pending separately approved host key and known-hosts setup")
+
+TLS_VERIFY = os.environ.get("AUTHENTIK_CA_FILE") or True
 
 AK = os.environ["AUTHENTIK_URL"].rstrip("/")
 AK_TOKEN = os.environ["AUTHENTIK_TOKEN"]
 APP = os.environ["APP_URL"].rstrip("/")
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_RUNNERS_URL = os.environ["GITHUB_RUNNERS_URL"]
 GROUP_NAME = os.environ.get("GROUP_NAME", "CI Runners")
-TEST_USER = os.environ.get("TEST_USER", "ci-console-e2e")
+TEST_USER = os.environ.get("TEST_USER", "ci-console-e2e-" + secrets.token_hex(8))
 # Generated per run rather than hard-coded: the user exists only for the duration
 # of this check and is deleted afterwards, so its password should never be a
 # constant sitting in version control.
@@ -46,10 +51,11 @@ def check(name, ok, detail=""):
 def ak_call(method, path, body=None):
     r = requests.request(
         method, f"{AK}/api/v3{path}", headers=ak_headers,
-        data=json.dumps(body) if body is not None else None, verify=False, timeout=30,
+        data=json.dumps(body) if body is not None else None, verify=TLS_VERIFY, timeout=30,
+        allow_redirects=False,
     )
-    if r.status_code >= 400:
-        raise SystemExit(f"{method} {path} -> {r.status_code}\n{r.text}")
+    if not 200 <= r.status_code < 300:
+        raise SystemExit(f"{method} {path} -> {r.status_code}")
     return r.json() if r.text else {}
 
 
@@ -58,21 +64,26 @@ def ak_call(method, path, body=None):
 def ensure_test_user():
     existing = ak_call("GET", f"/core/users/?username={TEST_USER}")["results"]
     if existing:
-        user = existing[0]
+        raise SystemExit("refusing to overwrite or delete an existing user")
     else:
         user = ak_call("POST", "/core/users/", {
             "username": TEST_USER, "name": "CI Console E2E",
             "email": "ci-console-e2e@example.invalid", "is_active": True, "type": "internal",
         })
-    ak_call("POST", f"/core/users/{user['pk']}/set_password/", {"password": TEST_PASS})
-    groups = ak_call("GET", f"/core/groups/?name={urllib.parse.quote(GROUP_NAME)}")["results"]
-    ak_call("POST", f"/core/groups/{groups[0]['pk']}/add_user/", {"pk": user["pk"]})
+    try:
+        ak_call("POST", f"/core/users/{user['pk']}/set_password/", {"password": TEST_PASS})
+        groups = ak_call("GET", f"/core/groups/?name={urllib.parse.quote(GROUP_NAME)}")["results"]
+        ak_call("POST", f"/core/groups/{groups[0]['pk']}/add_user/", {"pk": user["pk"]})
+    except BaseException:
+        delete_test_user(user)
+        raise
     return user
 
 
 def delete_test_user(user):
-    requests.delete(f"{AK}/api/v3/core/users/{user['pk']}/", headers=ak_headers,
-                    verify=False, timeout=30)
+    response = requests.delete(f"{AK}/api/v3/core/users/{user['pk']}/", headers=ak_headers,
+                               verify=TLS_VERIFY, timeout=30, allow_redirects=False)
+    response.raise_for_status()
 
 
 # ------------------------------------------------------------- OIDC sign-in
@@ -122,7 +133,7 @@ def sign_in():
     driving flows until Authentik sends us back to the application.
     """
     s = requests.Session()
-    s.verify = False
+    s.verify = TLS_VERIFY
 
     url = s.get(f"{APP}/auth/login", allow_redirects=True, timeout=30).url
     for _ in range(4):
@@ -156,7 +167,7 @@ def main():
 def run(user):
     print("\n== Acceptance criterion 6: access is gated by Authentik SSO")
     anon = requests.Session()
-    anon.verify = False
+    anon.verify = TLS_VERIFY
     r = anon.get(f"{APP}/api/inventory", timeout=30)
     check("unauthenticated API call is refused", r.status_code == 401, r.status_code)
     r = anon.get(f"{APP}/", allow_redirects=False, timeout=30)
@@ -197,7 +208,7 @@ def run(user):
           f"{inv['cap']['used']}/{inv['cap']['limit']}")
 
     print("\n== Acceptance criterion 3: add a runner")
-    name = "e2e-runner-1"
+    name = "e2e-" + secrets.token_hex(8)
     t0 = time.time()
     r = s.post(f"{APP}/api/runners", json={"name": name, "labels": ["e2e", "ubuntu-24.04"]},
                headers={"Origin": APP}, timeout=300)
@@ -208,116 +219,88 @@ def run(user):
           created.get("githubStatus"))
     print(f"       (took {time.time() - t0:.0f}s)")
 
-    inv = s.get(f"{APP}/api/inventory", timeout=60).json()
-    row = next((x for x in inv["runners"] if x["name"] == name), None)
-    check("new runner appears online in inventory", row and row["state"] in ("online", "busy"),
-          row["state"] if row else "missing")
-    check("labels applied", row and "e2e" in (row["github"] or {}).get("labels", []),
-          (row["github"] or {}).get("labels") if row else None)
-    check("existing runner untouched by the addition",
-          any(x["name"] == "actions-runner" and x["state"] == "unregistered"
-              for x in inv["runners"]))
-
-    print("\n== Acceptance criterion 2: start / stop / restart")
-    r = s.post(f"{APP}/api/runners/{name}/stop", headers={"Origin": APP}, timeout=120)
-    check("stop succeeds", r.status_code == 200 and r.json().get("active") == "inactive",
-          r.json())
-    time.sleep(8)
-    inv = s.get(f"{APP}/api/inventory", timeout=60).json()
-    row = next((x for x in inv["runners"] if x["name"] == name), None)
-    check("stopped state reflected", row and row["state"] == "stopped",
-          row["state"] if row else "missing")
-
-    r = s.post(f"{APP}/api/runners/{name}/start", headers={"Origin": APP}, timeout=120)
-    check("start succeeds", r.status_code == 200 and r.json().get("active") == "active", r.json())
-    r = s.post(f"{APP}/api/runners/{name}/restart", headers={"Origin": APP}, timeout=120)
-    check("restart succeeds", r.status_code == 200 and r.json().get("active") == "active", r.json())
-
-    deadline = time.time() + 90
-    back_online = False
-    while time.time() < deadline:
+    if r.status_code != 200 or not created.get("ok"):
+        raise SystemExit("runner creation failed")
+    try:
         inv = s.get(f"{APP}/api/inventory", timeout=60).json()
         row = next((x for x in inv["runners"] if x["name"] == name), None)
-        if row and row["state"] in ("online", "busy"):
-            back_online = True
-            break
-        time.sleep(5)
-    check("GitHub reflects the runner back online after restart", back_online,
-          row["state"] if row else "missing")
+        check("new runner appears online in inventory", row and row["state"] in ("online", "busy"),
+              row["state"] if row else "missing")
+        check("labels applied", row and "e2e" in (row["github"] or {}).get("labels", []),
+              (row["github"] or {}).get("labels") if row else None)
+        check("existing runner untouched by the addition",
+              any(x["name"] == "actions-runner" and x["state"] == "unregistered"
+                  for x in inv["runners"]))
 
-    if os.environ.get("REBOOT_TEST") == "1":
-        print("\n== Acceptance criterion 7: survives a runner VM reboot")
-        import subprocess
+        print("\n== Acceptance criterion 2: start / stop / restart")
+        r = s.post(f"{APP}/api/runners/{name}/stop", headers={"Origin": APP}, timeout=120)
+        check("stop succeeds", r.status_code == 200 and r.json().get("active") == "inactive",
+              r.json())
+        time.sleep(8)
+        inv = s.get(f"{APP}/api/inventory", timeout=60).json()
+        row = next((x for x in inv["runners"] if x["name"] == name), None)
+        check("stopped state reflected", row and row["state"] == "stopped",
+              row["state"] if row else "missing")
 
-        subprocess.run(
-            ["ssh", "-i", os.path.expanduser("~/.ssh/ci-runner-vm"),
-             "-o", "StrictHostKeyChecking=no", "runner@192.168.10.96",
-             "sudo systemctl reboot"],
-            check=False, capture_output=True, timeout=60,
-        )
-        print("       rebooting the runner VM…")
-        time.sleep(45)
+        r = s.post(f"{APP}/api/runners/{name}/start", headers={"Origin": APP}, timeout=120)
+        check("start succeeds", r.status_code == 200 and r.json().get("active") == "active", r.json())
+        r = s.post(f"{APP}/api/runners/{name}/restart", headers={"Origin": APP}, timeout=120)
+        check("restart succeeds", r.status_code == 200 and r.json().get("active") == "active", r.json())
 
-        # The console must recover on its own — no manual step, no restart of the app.
-        deadline = time.time() + 300
-        recovered = False
-        last = None
+        deadline = time.time() + 90
+        back_online = False
         while time.time() < deadline:
-            try:
-                inv = s.get(f"{APP}/api/inventory", timeout=60).json()
-                row = next((x for x in inv["runners"] if x["name"] == name), None)
-                last = row["state"] if row else "missing"
-                if row and row["state"] in ("online", "busy"):
-                    recovered = True
-                    break
-            except Exception as e:  # the VM is unreachable mid-reboot; that is expected
-                last = f"{type(e).__name__}"
-            time.sleep(10)
+            inv = s.get(f"{APP}/api/inventory", timeout=60).json()
+            row = next((x for x in inv["runners"] if x["name"] == name), None)
+            if row and row["state"] in ("online", "busy"):
+                back_online = True
+                break
+            time.sleep(5)
+        check("GitHub reflects the runner back online after restart", back_online,
+              row["state"] if row else "missing")
 
-        check("runner comes back online by itself after a VM reboot", recovered, last)
-        check("its service is enabled so systemd restarts it unprompted",
-              bool(row) and row["local"] and row["local"]["enabled"] == "enabled",
-              row["local"]["enabled"] if row and row["local"] else None)
-        check("console reconciles without being restarted",
-              s.get(f"{APP}/api/inventory", timeout=60).status_code == 200)
+        print("\n== Acceptance criterion 4 (guardrails): duplicate names and cap")
+        r = s.post(f"{APP}/api/runners", json={"name": name, "labels": []},
+                   headers={"Origin": APP}, timeout=60)
+        check("duplicate name refused", r.status_code == 409, r.status_code)
+        r = s.post(f"{APP}/api/runners", json={"name": "bad name!", "labels": []},
+                   headers={"Origin": APP}, timeout=60)
+        check("invalid name refused", r.status_code == 400, r.status_code)
+        r = s.post(f"{APP}/api/runners", json={"name": "x2", "labels": []},
+                   headers={"Origin": "https://evil.example.com"}, timeout=60)
+        check("cross-origin mutation refused", r.status_code == 403, r.status_code)
 
-    print("\n== Acceptance criterion 4 (guardrails): duplicate names and cap")
-    r = s.post(f"{APP}/api/runners", json={"name": name, "labels": []},
-               headers={"Origin": APP}, timeout=60)
-    check("duplicate name refused", r.status_code == 409, r.status_code)
-    r = s.post(f"{APP}/api/runners", json={"name": "bad name!", "labels": []},
-               headers={"Origin": APP}, timeout=60)
-    check("invalid name refused", r.status_code == 400, r.status_code)
-    r = s.post(f"{APP}/api/runners", json={"name": "x2", "labels": []},
-               headers={"Origin": "https://evil.example.com"}, timeout=60)
-    check("cross-origin mutation refused", r.status_code == 403, r.status_code)
+        print("\n== Acceptance criterion 4: delete leaves no orphan")
+        r = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
+        body = r.json()
+        check("delete succeeds", r.status_code == 200 and body.get("ok"), str(body)[:300])
+        inv = s.get(f"{APP}/api/inventory", timeout=60).json()
+        check("no local instance left behind",
+              not any(x["name"] == name for x in inv["runners"]),
+              [x["name"] for x in inv["runners"]])
+        gh = requests.get(
+            GITHUB_RUNNERS_URL,
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github+json"}, timeout=30).json()
+        check("no GitHub registration left behind",
+              not any(x["name"] == name for x in gh.get("runners", [])),
+              [x["name"] for x in gh.get("runners", [])])
 
-    print("\n== Acceptance criterion 4: delete leaves no orphan")
-    r = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
-    body = r.json()
-    check("delete succeeds", r.status_code == 200 and body.get("ok"), str(body)[:300])
-    inv = s.get(f"{APP}/api/inventory", timeout=60).json()
-    check("no local instance left behind",
-          not any(x["name"] == name for x in inv["runners"]),
-          [x["name"] for x in inv["runners"]])
-    gh = requests.get(
-        "https://api.github.com/repos/C-Nucifora/reconcile-app/actions/runners",
-        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                 "Accept": "application/vnd.github+json"}, timeout=30).json()
-    check("no GitHub registration left behind",
-          not any(x["name"] == name for x in gh.get("runners", [])),
-          [x["name"] for x in gh.get("runners", [])])
+        print("\n== Acceptance criterion 6: mutations are audit-logged with the SSO identity")
+        entries = s.get(f"{APP}/api/audit?limit=100", timeout=30).json()["entries"]
+        mine = [e for e in entries if e["actor"]["username"] == TEST_USER]
+        actions = {e["action"] for e in mine}
+        check("every mutation recorded against the acting identity",
+              {"runner.create", "runner.stop", "runner.start", "runner.restart",
+               "runner.delete"} <= actions, sorted(actions))
+        blob = json.dumps(entries)
+        check("no GitHub token of any kind appears in the audit log",
+              not any(m in blob for m in ("ghp_", "gho_", "github_pat_", "A" * 20)))
 
-    print("\n== Acceptance criterion 6: mutations are audit-logged with the SSO identity")
-    entries = s.get(f"{APP}/api/audit?limit=100", timeout=30).json()["entries"]
-    mine = [e for e in entries if e["actor"]["username"] == TEST_USER]
-    actions = {e["action"] for e in mine}
-    check("every mutation recorded against the acting identity",
-          {"runner.create", "runner.stop", "runner.start", "runner.restart",
-           "runner.delete"} <= actions, sorted(actions))
-    blob = json.dumps(entries)
-    check("no GitHub token of any kind appears in the audit log",
-          not any(m in blob for m in ("ghp_", "gho_", "github_pat_", "A" * 20)))
+    finally:
+        cleanup = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
+        if cleanup.status_code not in (200, 404):
+            raise RuntimeError(f"runner cleanup failed: HTTP {cleanup.status_code}")
 
 
 if __name__ == "__main__":

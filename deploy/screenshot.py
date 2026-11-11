@@ -16,7 +16,9 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.request
+import urllib.parse
 
 import websockets
 
@@ -53,10 +55,11 @@ class Cdp:
 
 async def capture(session_cookie):
     os.makedirs(OUT, exist_ok=True)
+    profile = tempfile.TemporaryDirectory(prefix="crc-browser-")
     proc = subprocess.Popen(
         ["chromium", "--headless=new", "--remote-debugging-port=9333",
-         "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
-         "--user-data-dir=" + os.path.join(OUT, "profile"), "about:blank"],
+         "--remote-debugging-address=127.0.0.1", "--disable-gpu", "--hide-scrollbars",
+         "--user-data-dir=" + profile.name, "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
@@ -79,7 +82,7 @@ async def capture(session_cookie):
             cdp = Cdp(ws)
             await cdp.send("Network.enable")
             await cdp.send("Page.enable")
-            host = APP.split("://", 1)[1]
+            host = urllib.parse.urlsplit(APP).hostname
             await cdp.send("Network.setCookie", name="crc_session", value=session_cookie,
                            domain=host, path="/", secure=True, httpOnly=True)
 
@@ -121,7 +124,12 @@ async def capture(session_cookie):
                 print(f"wrote {path} ({full}px tall)")
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        profile.cleanup()
 
 
 def main():
@@ -129,12 +137,8 @@ def main():
     user = e2e.ensure_test_user()
     try:
         s, _ = e2e.sign_in()
-        # Give the dashboard something interesting to show.
-        s.post(f"{APP}/api/runners", json={"name": "demo-runner", "labels": ["demo"]},
-               headers={"Origin": APP}, timeout=300)
         cookie = s.cookies.get("crc_session")
         asyncio.run(capture(cookie))
-        s.delete(f"{APP}/api/runners/demo-runner", headers={"Origin": APP}, timeout=300)
     finally:
         e2e.delete_test_user(user)
 

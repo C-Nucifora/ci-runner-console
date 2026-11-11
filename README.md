@@ -49,9 +49,10 @@ a small flat array of strings, checks the first element against a fixed allowlis
 (`list`, `headroom`, `status`, `logs`, `start`, `stop`, `restart`, `create`,
 `remove`), and only then execs the real script. **There is no operation that passes
 arbitrary shell through from the UI**, and a fully compromised control plane still
-cannot get a shell, forward a port, or run anything off the list. Parameters are
-validated twice — in the wrapper and again in `ci-runner-ctl` — so a gap in one
-layer is not sufficient on its own.
+cannot request a shell, forward a port, or run an operation off the list. The
+wrapper and privileged script both validate parameters. Each boundary must be
+safe on its own; duplicate validation does not protect unsafe filesystem writes,
+runner-controlled metadata, or partial failures.
 
 Other properties:
 
@@ -64,8 +65,10 @@ Other properties:
   `X-authentik-*`, `X-Remote-User`, …) before any handler runs, and logged when
   seen. The app authenticates users itself over OIDC. This matters because it also
   listens on a LAN port that does not pass through the proxy.
-- **Every mutation is audit-logged** against the acting SSO identity, on failure as
-  well as success, to an append-only JSONL file.
+- **Mutations have a durable audit intent** written before dispatch and an outcome
+  written afterward, linked by an operation ID. An intent without an outcome is
+  shown as unresolved and needs reconciliation before retrying. The JSONL file
+  relies on service filesystem permissions and host administration for integrity.
 - **The control plane does not run on the runner VM**, and nothing on the runner VM
   can reach it. Do not assume the network enforces this for you: unless you have
   an egress policy on the runner VM, a job can reach anything the VM can, so keep
@@ -92,6 +95,19 @@ gets a row and the row names the disagreement:
 Orphans on either side stay deletable — that is how they get cleaned up. If GitHub
 is unreachable the console says so and shows local state only, rather than
 accusing every runner of being an orphan.
+
+Unavailable GitHub state disables mutations, including orphan cleanup. Failed
+registration or removal retains recoverable local state. Refresh inventory before
+retrying an operation whose response reports partial or completed work.
+
+Busy checks are best effort. The pinned runner has no atomic drain command, so a
+job can start between the final GitHub check and stop, restart, or removal. Its
+shutdown wrapper can kill a job after 30 seconds. These controls do not guarantee
+uninterrupted jobs; drain scheduling externally before using them.
+
+The console allows five minutes for in-flight requests to finish during shutdown.
+The systemd unit allows 330 seconds. Give containers an equivalent stop timeout;
+an interrupted operation remains an unresolved audit intent until reconciled.
 
 ## Configuration
 
@@ -126,21 +142,43 @@ stages the pinned runner distribution (SHA-256 verified), and writes the cap to
 To create the Authentik application and provider:
 
 ```bash
-AUTHENTIK_URL=https://<authentik> AUTHENTIK_PUBLIC_URL=https://<public> \
+ALLOW_AUTHENTIK_SETUP=1 AUTHENTIK_URL=https://<authentik> AUTHENTIK_PUBLIC_URL=https://<public> \
+REDIRECT_URI=https://<console>/auth/callback \
 AUTHENTIK_TOKEN=<admin api token> MEMBER_PKS=<user pks> \
 python3 deploy/authentik-setup.py
 ```
 
 ## Verifying
 
+For isolated checks without infrastructure credentials:
+
 ```bash
-AUTHENTIK_URL=... AUTHENTIK_TOKEN=... APP_URL=... GITHUB_TOKEN=... \
-  python3 deploy/e2e-check.py          # add REBOOT_TEST=1 to also reboot the VM
+npm ci --ignore-scripts
+npm run typecheck
+npm test
+npm run build
+python3 test/vm-boundaries.py
+```
+
+The tests use synthetic identities and temporary state. Development and preview
+servers bind to `127.0.0.1`. Do not publish their ports through a public proxy. If
+running the production image locally, publish explicitly to loopback with
+`-p 127.0.0.1:8080:8080`; `EXPOSE` alone does not publish a container port.
+
+The following is a separate **live acceptance** procedure. It changes Authentik
+and runner state and requires explicit approval for the target infrastructure.
+
+```bash
+ALLOW_LIVE_CHECKS=1 AUTHENTIK_URL=... AUTHENTIK_TOKEN=... APP_URL=... GITHUB_TOKEN=... \
+  GITHUB_RUNNERS_URL=https://api.github.com/repos/OWNER/REPO/actions/runners \
+  python3 deploy/e2e-check.py
 ```
 
 Signs in through Authentik as a temporary user (created and deleted per run) and
 exercises the whole lifecycle against the live deployment, including that forged
 proxy headers do not authenticate and that delete leaves no orphan on either side.
+`REBOOT_TEST=1` refuses to run until a separately approved host and host-key setup
+is available. Setting the live-check flag does not approve reboot testing.
 
 `deploy/screenshot.py` renders the signed-in console in headless Chromium for light
 and dark mode, and fails if the app did not actually mount.
