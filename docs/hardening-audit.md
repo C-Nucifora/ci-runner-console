@@ -4,7 +4,7 @@
 
 Baseline `247135a5b6dbd224b5a840a53fedb6dd09a118b2` on `master`. The checkout was clean when this task started; all changes in this session belong to this task. No reliable branch push date was available from the remote-tracking reflog or public push events, so local commit timing uses the past-day fallback.
 
-The console still manages runner instances inside one existing VM. Instances share that VM's filesystem, user and Docker boundary. Authentik remains the identity provider. Testing uses synthetic identities, temporary keys and state, fake GitHub/systemd/runner executables, and loopback SSH/HTTP servers. No real runners, jobs, Authentik configuration, host services, firewall rules or remote settings were changed. Nothing was pushed or deployed.
+The console still manages runner instances inside one existing VM. Instances share that VM's filesystem, user and Docker boundary. Authentik remains the identity provider. Testing uses synthetic identities, temporary keys and state, fake GitHub/systemd/runner executables, and loopback SSH/HTTP servers. No real runners, jobs, Authentik configuration, host services, firewall rules or remote settings were changed. This original audit ended with local commits and no deployment. Subsequent authorized topic-branch publication is recorded in [the extended round ledger](swarm-audit.md).
 
 All build/test commands after resource steering use `TMPDIR=/home/christian/.local/share/agent-tmp`, with serial execution and low compiler/test parallelism. Existing or unidentified temporary files were left alone. The shared design-context router was unavailable; UI changes preserve the existing design and address errors, pending states and accessibility.
 

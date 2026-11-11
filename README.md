@@ -160,7 +160,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm run build
-python3 test/vm-boundaries.py
+npm run test:vm
 ```
 
 The tests use synthetic identities and temporary state. Development and preview

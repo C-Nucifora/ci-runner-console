@@ -15,6 +15,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "test": "npm run build:test && node --test dist-test/test/*.test.js",
+    "test:vm": "for suite in test/*boundaries.py; do python3 \"$suite\" || exit; done",
     "build:test": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
