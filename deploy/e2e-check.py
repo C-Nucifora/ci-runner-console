@@ -210,18 +210,22 @@ def run(user):
     print("\n== Acceptance criterion 3: add a runner")
     name = "e2e-" + secrets.token_hex(8)
     t0 = time.time()
-    r = s.post(f"{APP}/api/runners", json={"name": name, "labels": ["e2e", "ubuntu-24.04"]},
-               headers={"Origin": APP}, timeout=300)
-    created = r.json()
-    check("create returns success", r.status_code == 200 and created.get("ok"),
-          f"{r.status_code} {str(created)[:300]}")
-    check("GitHub confirms the runner online", created.get("confirmedInGitHub") is True,
-          created.get("githubStatus"))
-    print(f"       (took {time.time() - t0:.0f}s)")
-
-    if r.status_code != 200 or not created.get("ok"):
-        raise SystemExit("runner creation failed")
+    owns_runner = False
     try:
+        r = s.post(f"{APP}/api/runners", json={"name": name, "labels": ["e2e", "ubuntu-24.04"]},
+                   headers={"Origin": APP}, timeout=300)
+        created = r.json()
+        # Only a confirmed create establishes ownership, never an arbitrary error.
+        owns_runner = (r.status_code == 200 and created.get("ok") is True) or (
+            r.status_code in (502, 503) and created.get("operationState") == "completed")
+        check("create returns success", r.status_code == 200 and created.get("ok") is True,
+              f"{r.status_code} {str(created)[:300]}")
+        check("GitHub confirms the runner online", created.get("confirmedInGitHub") is True,
+              created.get("githubStatus"))
+        print(f"       (took {time.time() - t0:.0f}s)")
+
+        if r.status_code != 200 or created.get("ok") is not True:
+            raise SystemExit("runner creation failed")
         inv = s.get(f"{APP}/api/inventory", timeout=60).json()
         row = next((x for x in inv["runners"] if x["name"] == name), None)
         check("new runner appears online in inventory", row and row["state"] in ("online", "busy"),
@@ -274,6 +278,8 @@ def run(user):
         r = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
         body = r.json()
         check("delete succeeds", r.status_code == 200 and body.get("ok"), str(body)[:300])
+        if r.status_code == 200 and body.get("ok") is True:
+            owns_runner = False
         inv = s.get(f"{APP}/api/inventory", timeout=60).json()
         check("no local instance left behind",
               not any(x["name"] == name for x in inv["runners"]),
@@ -298,9 +304,14 @@ def run(user):
               not any(m in blob for m in ("ghp_", "gho_", "github_pat_", "A" * 20)))
 
     finally:
-        cleanup = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
-        if cleanup.status_code not in (200, 404):
-            raise RuntimeError(f"runner cleanup failed: HTTP {cleanup.status_code}")
+        if owns_runner:
+            cleanup = s.delete(f"{APP}/api/runners/{name}", headers={"Origin": APP}, timeout=300)
+            if cleanup.status_code not in (200, 404):
+                raise RuntimeError(f"runner cleanup failed for {name}: HTTP {cleanup.status_code}; "
+                                   "manual reconciliation required")
+        else:
+            print(f"       No automatic cleanup for {name}: creation was not confirmed "
+                  "or deletion already succeeded. Reconcile any uncertain state manually.")
 
 
 if __name__ == "__main__":
