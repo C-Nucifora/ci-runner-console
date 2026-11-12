@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
 import type { Identity } from './session.js';
+import { boundedFetch } from '../http.js';
 
 interface ProviderMetadata {
   issuer: string;
@@ -39,18 +40,29 @@ export class OidcClient {
   async metadata(): Promise<ProviderMetadata> {
     if (this.#metadata) return this.#metadata;
 
+    const issuerUrl = new URL(this.cfg.issuer);
+    if (!secureTransport(issuerUrl) || issuerUrl.username || issuerUrl.password || issuerUrl.search || issuerUrl.hash) {
+      throw new OidcError('OIDC issuer must use HTTPS or loopback HTTP without credentials query or fragment');
+    }
     const base = this.cfg.issuer.replace(/\/+$/, '');
     const url = `${base}/.well-known/openid-configuration`;
-    const res = await fetch(url, { headers: { accept: 'application/json' } });
+    const res = await boundedFetch(url, { headers: { accept: 'application/json' } });
     if (!res.ok) {
       throw new OidcError(`OIDC discovery failed at ${url}: HTTP ${res.status}`);
     }
     const meta = (await res.json()) as ProviderMetadata;
     for (const field of ['issuer', 'authorization_endpoint', 'token_endpoint', 'jwks_uri'] as const) {
-      if (!meta[field]) throw new OidcError(`OIDC discovery document is missing ${field}`);
+      if (typeof meta[field] !== 'string' || !meta[field]) throw new OidcError(`OIDC discovery document is missing ${field}`);
+    }
+    if (meta.issuer !== this.cfg.issuer) throw new OidcError('OIDC issuer mismatch');
+    for (const endpoint of [meta.authorization_endpoint, meta.token_endpoint, meta.jwks_uri, meta.end_session_endpoint].filter(Boolean)) {
+      const url = new URL(endpoint!);
+      if (!secureTransport(url) || url.username || url.password || url.hash) {
+        throw new OidcError('OIDC endpoints must use HTTPS or loopback HTTP without credentials or fragments');
+      }
     }
     this.#metadata = meta;
-    this.#jwks = createRemoteJWKSet(new URL(meta.jwks_uri));
+    this.#jwks = createRemoteJWKSet(new URL(meta.jwks_uri), { [customFetch]: boundedFetch });
     return meta;
   }
 
@@ -92,7 +104,7 @@ export class OidcClient {
       code_verifier: verifier,
     });
 
-    const res = await fetch(meta.token_endpoint, {
+    const res = await boundedFetch(meta.token_endpoint, {
       method: 'POST',
       headers: {
         'content-type': 'application/x-www-form-urlencoded',
@@ -110,13 +122,26 @@ export class OidcClient {
     }
 
     const tokens = (await res.json()) as { id_token?: string };
-    if (!tokens.id_token) throw new OidcError('Token response contained no id_token');
+    if (typeof tokens.id_token !== 'string' || !tokens.id_token) throw new OidcError('Token response contained no id_token');
 
     if (!this.#jwks) throw new OidcError('JWKS not initialised');
     const { payload } = await jwtVerify(tokens.id_token, this.#jwks, {
-      issuer: meta.issuer,
+      issuer: this.cfg.issuer,
+      algorithms: ['RS256', 'ES256'],
+      requiredClaims: ['sub', 'exp', 'iat', 'nonce'],
       audience: this.cfg.clientId,
     });
+
+    if (typeof payload.sub !== 'string' || !payload.sub ||
+        typeof payload.iat !== 'number' || payload.iat > Math.floor(Date.now() / 1000) ||
+        (payload.azp !== undefined && payload.azp !== this.cfg.clientId) ||
+        (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== this.cfg.clientId)) {
+      throw new OidcError('Invalid ID token claims');
+    }
+    if (payload.groups !== undefined &&
+        (!Array.isArray(payload.groups) || !payload.groups.every((g) => typeof g === 'string'))) {
+      throw new OidcError('Invalid group claim');
+    }
 
     if (payload.nonce !== nonce) {
       throw new OidcError('ID token nonce did not match the login request');
@@ -128,7 +153,7 @@ export class OidcClient {
       const permitted = identity.groups.some((g) => this.cfg.allowedGroups.includes(g));
       if (!permitted) {
         throw new OidcError(
-          `${identity.username} is not a member of any group permitted to use this console`,
+          'User is not a member of a permitted group',
         );
       }
     }
@@ -144,6 +169,11 @@ export class OidcClient {
     url.searchParams.set('client_id', this.cfg.clientId);
     return url.toString();
   }
+}
+
+function secureTransport(url: URL): boolean {
+  return url.protocol === 'https:' ||
+    (url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname));
 }
 
 function toIdentity(payload: JWTPayload): Identity {

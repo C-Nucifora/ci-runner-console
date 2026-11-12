@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import ssh2 from 'ssh2';
 import { z } from 'zod';
 
 /**
@@ -15,9 +16,23 @@ function secret(name: string): string | undefined {
 }
 
 const nonEmpty = z.string().trim().min(1);
+const maxTimerMs = 2_147_483_647;
+const timerMs = z.coerce.number().int().positive().max(maxTimerMs);
+const githubName = z.string().trim().regex(/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/);
+const optionalGithubName = z.union([githubName, z.literal('')]).optional();
+const runnerName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/)
+  .refine((value) => !value.includes('..'), 'runner names cannot contain consecutive dots');
+
+const httpUrl = z.string().url().superRefine((value, ctx) => {
+  if (!URL.canParse(value)) return;
+  const url = new URL(value);
+  if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname))) || url.username || url.password || url.search || url.hash) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'must use HTTPS or loopback HTTP without credentials query or fragment' });
+  }
+});
 
 const schema = z.object({
-  host: z.string().default('0.0.0.0'),
+  host: nonEmpty.default('127.0.0.1'),
   port: z.coerce.number().int().min(1).max(65535).default(8080),
 
   /**
@@ -26,13 +41,14 @@ const schema = z.object({
    * and deriving it from attacker-controllable headers is how redirect-URI
    * confusion bugs happen.
    */
-  publicBaseUrl: z.string().url(),
+  publicBaseUrl: httpUrl.refine((value) => URL.canParse(value) && new URL(value).pathname === '/', 'must be an origin without a path')
+    .transform((value) => new URL(value).origin),
 
   sessionSecret: nonEmpty.min(32, 'SESSION_SECRET must be at least 32 characters'),
-  sessionTtlSeconds: z.coerce.number().int().positive().default(8 * 60 * 60),
+  sessionTtlSeconds: z.coerce.number().int().positive().max(Math.floor(maxTimerMs / 1000)).default(8 * 60 * 60),
 
   oidc: z.object({
-    issuer: z.string().url(),
+    issuer: httpUrl,
     clientId: nonEmpty,
     clientSecret: nonEmpty,
     /** If non-empty, the user must hold at least one of these Authentik groups. */
@@ -43,11 +59,11 @@ const schema = z.object({
     token: nonEmpty,
     /** Repo-level runners need only `repo`; org-level needs the org runners permission. */
     scope: z.enum(['repo', 'org']),
-    owner: nonEmpty,
-    repo: z.string().trim().optional(),
+    owner: githubName,
+    repo: optionalGithubName,
     /** Org runner group to place new runners in. Ignored for repo scope. */
-    runnerGroup: z.string().trim().optional(),
-    apiBaseUrl: z.string().url().default('https://api.github.com'),
+    runnerGroup: z.union([z.string().trim().regex(/^[A-Za-z0-9._ -]{1,64}$/), z.literal('')]).optional(),
+    apiBaseUrl: httpUrl.default('https://api.github.com'),
   }),
 
   vm: z.object({
@@ -60,20 +76,23 @@ const schema = z.object({
      * Without this the first connection would trust whatever answers on the LAN,
      * and the runner VM sits on a flat network the control plane does not own.
      */
-    hostKey: nonEmpty,
-    connectTimeoutMs: z.coerce.number().int().positive().default(15_000),
-    commandTimeoutMs: z.coerce.number().int().positive().default(180_000),
+    hostKey: nonEmpty.refine((value) => {
+      const key = ssh2.utils.parseKey(value);
+      return !(key instanceof Error) && !Array.isArray(key) && !key.isPrivateKey();
+    }, 'must be an OpenSSH public host key'),
+    connectTimeoutMs: timerMs.default(15_000),
+    commandTimeoutMs: timerMs.default(180_000),
   }),
 
   runners: z.object({
     cap: z.coerce.number().int().min(1).max(16).default(3),
-    defaultLabels: z.array(z.string()).default([]),
+    defaultLabels: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,39}$/)).max(20).default([]),
     /** Refuse to touch these names even if they appear in the inventory. */
-    protectedNames: z.array(z.string()).default([]),
+    protectedNames: z.array(runnerName).default([]),
   }),
 
   auditLogPath: nonEmpty.default('/var/lib/ci-runner-console/audit.jsonl'),
-  pollIntervalMs: z.coerce.number().int().positive().default(15_000),
+  pollIntervalMs: timerMs.default(15_000),
 });
 
 export type Config = z.infer<typeof schema>;
@@ -140,9 +159,6 @@ export function loadConfig(): Config {
   }
   if (config.github.scope === 'repo' && config.github.runnerGroup) {
     throw new Error('GITHUB_RUNNER_GROUP is only meaningful when GITHUB_SCOPE=org');
-  }
-  if (config.publicBaseUrl.endsWith('/')) {
-    config.publicBaseUrl = config.publicBaseUrl.replace(/\/+$/, '');
   }
 
   return config;

@@ -9,8 +9,16 @@ RUNNER_SHA256=${RUNNER_SHA256:-04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8
 MAX_RUNNERS=${MAX_RUNNERS:-3}
 RUNNER_USER=${RUNNER_USER:-runner}
 
-pubkey=$(cat)
-[[ $pubkey == ssh-* || $pubkey == ecdsa-* ]] || { echo "stdin must be an SSH public key" >&2; exit 1; }
+[[ $RUNNER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+[[ $RUNNER_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || exit 1
+[[ $MAX_RUNNERS =~ ^[1-9][0-9]{0,3}$ ]] || exit 1
+[[ $RUNNER_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || exit 1
+runner_uid=$(id -u -- "$RUNNER_USER") || exit 1
+[[ $runner_uid =~ ^[0-9]+$ && $runner_uid -ne 0 ]] || exit 1
+pubkey=$(head -c 16385)
+(( ${#pubkey} <= 16384 )) || exit 1
+[[ $pubkey != *$'\n'* && $pubkey != *$'\r'* ]] || exit 1
+[[ $pubkey =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))\ [A-Za-z0-9+/]+={0,2}(\ [^[:cntrl:]]*)?$ ]] || { echo "stdin must be one SSH public key" >&2; exit 1; }
 
 say() { printf '\n== %s\n' "$1"; }
 
@@ -20,7 +28,7 @@ sudo install -o root -g root -m 0755 /tmp/ci-runner-ctl-ssh /usr/local/sbin/ci-r
 rm -f /tmp/ci-runner-ctl /tmp/ci-runner-ctl-ssh
 
 say "Writing $MAX_RUNNERS-runner cap to /etc/ci-runner-ctl.conf"
-printf 'MAX_RUNNERS=%s\n' "$MAX_RUNNERS" | sudo tee /etc/ci-runner-ctl.conf >/dev/null
+printf 'MAX_RUNNERS=%s\nRUNNER_VERSION=%s\nRUNNER_SHA256=%s\nRUNNER_USER=%s\n' "$MAX_RUNNERS" "$RUNNER_VERSION" "$RUNNER_SHA256" "$RUNNER_USER" | sudo tee /etc/ci-runner-ctl.conf >/dev/null
 sudo chmod 0644 /etc/ci-runner-ctl.conf
 
 say "Creating instance and distribution directories"
@@ -32,7 +40,8 @@ if [[ -r $dist ]] && echo "$RUNNER_SHA256  $dist" | sha256sum -c - >/dev/null 2>
   echo "already staged and verified"
 else
   tmp=$(mktemp -d)
-  curl -fsSL -o "$tmp/runner.tar.gz" \
+  trap 'rm -rf "$tmp"' EXIT
+  curl --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 -fsSL -o "$tmp/runner.tar.gz" \
     "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
   echo "$RUNNER_SHA256  $tmp/runner.tar.gz" | sha256sum -c -
   sudo install -o root -g root -m 0644 "$tmp/runner.tar.gz" "$dist"
@@ -47,16 +56,31 @@ sudo chmod 0440 /etc/sudoers.d/ci-runner-ctl
 sudo visudo -cf /etc/sudoers.d/ci-runner-ctl
 
 say "Pinning the control-plane key to the forced command"
-ak=/home/$RUNNER_USER/.ssh/authorized_keys
-keybody=$(awk '{print $2}' <<<"$pubkey")
-sudo touch "$ak"
-# Drop any previous entry for this key before re-adding, so re-running cannot
-# accumulate duplicates or leave an unrestricted copy behind.
-sudo grep -vF -- "$keybody" "$ak" | sudo tee "$ak.new" >/dev/null || true
-printf 'command="/usr/local/sbin/ci-runner-ctl-ssh",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding %s\n' \
-  "$pubkey" | sudo tee -a "$ak.new" >/dev/null
-sudo install -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0600 "$ak.new" "$ak"
-sudo rm -f "$ak.new"
+# Write account-owned SSH files as that account, never as root through a path
+# the account can replace with a symlink.
+printf '%s\n' "$pubkey" | sudo -u "$RUNNER_USER" -H python3 -c '
+import os, pathlib, sys, tempfile
+key = sys.stdin.read().strip()
+body = key.split()[1]
+folder = pathlib.Path.home() / ".ssh"
+folder.mkdir(mode=0o700, exist_ok=True)
+path = folder / "authorized_keys"
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as f:
+        old = f.read()
+except FileNotFoundError:
+    old = ""
+lines = [line for line in old.splitlines() if body not in line.split()]
+lines.append("command=\"/usr/local/sbin/ci-runner-ctl-ssh\",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding " + key)
+fd, tmp = tempfile.mkstemp(dir=folder)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+'
 
 say "Verifying"
 sudo /usr/local/sbin/ci-runner-ctl headroom

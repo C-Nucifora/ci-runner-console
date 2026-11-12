@@ -1,5 +1,8 @@
 node_modules
 dist
+dist-test
+test
+docs
 web/dist
 .git
 .gitignore

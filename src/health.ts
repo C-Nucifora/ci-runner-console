@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
+import { RequestError } from '@octokit/request-error';
 import type { Config } from './config.js';
 import type { GitHubCredential } from './github/credentials.js';
 import type { RunnerRegistry } from './github/registry.js';
+import { boundedFetch } from './http.js';
 import type { RunnerVmControl } from './vm/ctl.js';
 
 export interface HealthCheck {
@@ -53,6 +55,7 @@ async function checkGitHub({
       auth: await credential.getToken(),
       baseUrl: config.github.apiBaseUrl,
       userAgent: 'ci-runner-console',
+      request: { fetch: boundedFetch },
     });
 
     const rate = await octokit.request('GET /rate_limit');
@@ -79,7 +82,7 @@ async function checkGitHub({
       id: 'github',
       label: 'GitHub API',
       ok: true,
-      detail: `Authenticated and able to administer runners on ${registry.describe()}.`,
+      detail: `Authenticated and able to list runners on ${registry.describe()}.`,
       facts,
     };
   } catch (err) {
@@ -87,7 +90,7 @@ async function checkGitHub({
       id: 'github',
       label: 'GitHub API',
       ok: false,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: err instanceof RequestError ? `GitHub health check failed with HTTP ${err.status}.` : 'GitHub health check failed.',
       facts,
     };
   }
@@ -121,12 +124,12 @@ async function checkRunnerVm({
       detail: 'Reachable over the restricted SSH command allowlist.',
       facts,
     };
-  } catch (err) {
+  } catch {
     return {
       id: 'runner-vm',
       label: 'Runner VM',
       ok: false,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: 'Runner VM health check failed. Verify connectivity and the pinned host key.',
       facts,
     };
   }
@@ -146,18 +149,22 @@ async function checkOidc({ config }: { config: Config }): Promise<HealthCheck> {
 
   try {
     const base = config.oidc.issuer.replace(/\/+$/, '');
-    const res = await fetch(`${base}/.well-known/openid-configuration`, {
+    const res = await boundedFetch(`${base}/.well-known/openid-configuration`, {
       headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) throw new Error(`discovery returned HTTP ${res.status}`);
-    const meta = (await res.json()) as { jwks_uri?: string };
-    if (!meta.jwks_uri) throw new Error('discovery document has no jwks_uri');
+    const meta = (await res.json()) as { issuer?: string; jwks_uri?: string };
+    if (meta?.issuer !== config.oidc.issuer) throw new Error('discovery issuer does not match configuration');
+    if (typeof meta.jwks_uri !== 'string') throw new Error('discovery document has no jwks_uri');
+    const keyUrl = new URL(meta.jwks_uri);
+    if (keyUrl.origin !== new URL(config.oidc.issuer).origin || keyUrl.username || keyUrl.password) {
+      throw new Error('JWKS must use the configured issuer origin without credentials');
+    }
 
-    const jwks = await fetch(meta.jwks_uri, { signal: AbortSignal.timeout(10_000) });
+    const jwks = await boundedFetch(keyUrl);
     if (!jwks.ok) throw new Error(`JWKS returned HTTP ${jwks.status}`);
     const keys = (await jwks.json()) as { keys?: unknown[] };
-    const count = keys.keys?.length ?? 0;
+    const count = Array.isArray(keys?.keys) ? keys.keys.length : 0;
     if (count === 0) {
       // Authentik signs with HS256 when no signing key is set, which this app
       // cannot verify against a published JWKS.
@@ -169,15 +176,15 @@ async function checkOidc({ config }: { config: Config }): Promise<HealthCheck> {
       id: 'oidc',
       label: 'Authentik SSO',
       ok: true,
-      detail: 'Discovery and signing keys are reachable, so sign-in will work.',
+      detail: 'Discovery and signing keys are reachable. Sign-in and group access still require verification.',
       facts,
     };
-  } catch (err) {
+  } catch {
     return {
       id: 'oidc',
       label: 'Authentik SSO',
       ok: false,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: 'OIDC health check failed. Verify issuer discovery and signing keys.',
       facts,
     };
   }

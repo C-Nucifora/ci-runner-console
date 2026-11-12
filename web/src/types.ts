@@ -3,6 +3,8 @@ export type RunnerState =
   | 'busy'
   | 'disconnected'
   | 'stopped'
+  | 'service-changing'
+  | 'service-unknown'
   | 'no-service'
   | 'orphan-github'
   | 'orphan-local'
@@ -74,7 +76,7 @@ export interface AuditEntry {
   action: string;
   target: string | null;
   params: Record<string, unknown>;
-  outcome: 'success' | 'failure';
+  outcome: 'pending' | 'success' | 'failure';
   error?: string;
   durationMs: number;
   requestId: string;

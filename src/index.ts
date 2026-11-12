@@ -42,10 +42,14 @@ const IDENTITY_HEADERS = [
 
 async function main() {
   const config = loadConfig();
+  let closing = false;
 
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
+      serializers: {
+        req: (req) => ({ method: req.method, route: req.routeOptions?.url ?? 'unmatched', remoteAddress: req.ip }),
+      },
       // Belt and braces: even if a token reached the logger, it would not be printed.
       redact: {
         paths: [
@@ -62,13 +66,15 @@ async function main() {
     },
     trustProxy: false,
     bodyLimit: 64 * 1024,
+    forceCloseConnections: 'idle',
   });
 
   await app.register(cookie);
 
   app.addHook('onRequest', async (req) => {
-    let stripped: string[] = [];
-    for (const header of IDENTITY_HEADERS) {
+    const stripped: string[] = [];
+    for (const header of Object.keys(req.headers)) {
+      if (!IDENTITY_HEADERS.includes(header) && !header.startsWith('x-authentik-')) continue;
       if (header in req.headers) {
         delete req.headers[header];
         stripped.push(header);
@@ -84,7 +90,9 @@ async function main() {
     }
   });
 
-  app.addHook('onSend', async (_req, reply, payload) => {
+  app.addHook('onSend', async (req, reply, payload) => {
+    if (closing) reply.header('connection', 'close');
+    if (req.url.startsWith('/api/')) reply.header('cache-control', 'no-store');
     reply.header('x-content-type-options', 'nosniff');
     reply.header('x-frame-options', 'DENY');
     reply.header('referrer-policy', 'no-referrer');
@@ -144,6 +152,20 @@ async function main() {
     return reply.type('text/html').header('cache-control', 'no-store').send(indexHtml);
   });
 
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    // Allow bounded SSH actions to finish; durable audit intents survive a forced exit.
+    const deadline = setTimeout(() => process.exit(1), 300_000);
+    deadline.unref();
+    // Disconnected requests can keep working after HTTP closure resolves.
+    void app.close().catch((err) => {
+      app.log.error(err, 'shutdown failed');
+      process.exit(1);
+    });
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
   await app.listen({ host: config.host, port: config.port });
   app.log.info(
     {

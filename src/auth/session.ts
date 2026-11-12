@@ -36,7 +36,7 @@ export class SessionStore {
     this.#sweep();
     const id = randomBytes(32).toString('base64url');
     this.#sessions.set(id, {
-      identity,
+      identity: structuredClone(identity),
       expiresAt: Date.now() + this.ttlSeconds * 1000,
     });
     return `${id}.${this.#sign(id)}`;
@@ -57,14 +57,15 @@ export class SessionStore {
       this.#sessions.delete(id);
       return null;
     }
-    return record.identity;
+    return structuredClone(record.identity);
   }
 
   destroy(cookie: string | undefined): void {
     if (!cookie) return;
     const sep = cookie.lastIndexOf('.');
     if (sep <= 0) return;
-    this.#sessions.delete(cookie.slice(0, sep));
+    const id = cookie.slice(0, sep);
+    if (this.#verify(id, cookie.slice(sep + 1))) this.#sessions.delete(id);
   }
 
   #sign(id: string): string {
@@ -97,6 +98,7 @@ export class LoginStateStore {
 
   create(data: { verifier: string; nonce: string; returnTo: string }): string {
     this.#sweep();
+    if (this.#pending.size >= 1000) throw new Error('Too many pending sign-ins. Try again later.');
     const state = randomBytes(32).toString('base64url');
     this.#pending.set(state, { ...data, expiresAt: Date.now() + 10 * 60 * 1000 });
     return state;

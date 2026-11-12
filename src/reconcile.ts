@@ -16,6 +16,10 @@ export type RunnerState =
   | 'disconnected'
   /** Registered with GitHub, service installed but not running. Deliberate stop. */
   | 'stopped'
+  /** systemd is starting, stopping or reloading the service. */
+  | 'service-changing'
+  /** The service is not in a confirmed running or stopped state. */
+  | 'service-unknown'
   /** Registered with GitHub, present locally, but no systemd unit was ever installed. */
   | 'no-service'
   /** GitHub has a registration with nothing backing it on this VM. */
@@ -52,6 +56,7 @@ export interface Inventory {
   };
   target: string;
   registrationUrl: string;
+  githubAvailable: boolean;
   /** Non-fatal problems, e.g. GitHub unreachable while the VM answered fine. */
   warnings: string[];
   fetchedAt: string;
@@ -63,10 +68,21 @@ const NEEDS_ATTENTION: ReadonlySet<RunnerState> = new Set<RunnerState>([
   'unregistered',
   'no-service',
   'disconnected',
+  'service-changing',
+  'service-unknown',
 ]);
 
 export function needsAttention(state: RunnerState): boolean {
   return NEEDS_ATTENTION.has(state);
+}
+
+function serviceState(active: string | null | undefined): RunnerState {
+  if (active === 'active') return 'disconnected';
+  if (active === 'inactive' || active === 'failed') return 'stopped';
+  if (['activating', 'deactivating', 'reloading', 'refreshing'].includes(active ?? '')) {
+    return 'service-changing';
+  }
+  return 'service-unknown';
 }
 
 function classify(
@@ -80,6 +96,18 @@ function classify(
         'GitHub has a registration for this runner but no matching instance exists on the VM. ' +
         'Deleting it here will remove the stale registration.',
     };
+  }
+
+  if (local?.unit && local.serviceInstalled) {
+    const service = serviceState(local.active);
+    if (service === 'service-changing' || service === 'service-unknown') {
+      return {
+        state: service,
+        detail: service === 'service-changing'
+          ? `Service is ${local.active}. Wait for it to settle and refresh before acting.`
+          : `Service state is ${local.active ?? 'unknown'}. Refresh or inspect the service before acting.`,
+      };
+    }
   }
 
   if (!github && local) {
@@ -111,7 +139,8 @@ function classify(
     // systemd is authoritative for whether the process is running. GitHub's view is
     // eventually consistent and lags a stop by some seconds, so a runner that was
     // deliberately stopped must not flash up as a fault in the meantime.
-    if (local.active !== 'active') {
+    const service = serviceState(local.active);
+    if (service === 'stopped') {
       return {
         state: 'stopped',
         detail:
@@ -187,42 +216,29 @@ export async function buildInventory(
     warnings.push(`VM resource headroom is unavailable (${errText(headroomResult.reason)}).`);
   }
 
-  // Only registered instances can correspond to a GitHub registration. An
-  // unregistered directory that happens to share a name is a different thing and
-  // must not be silently merged with one.
-  const localByName = new Map<string, LocalInstance>();
-  for (const l of locals) {
-    if (l.registered) localByName.set(l.name, l);
-  }
-  const unregisteredLocals = locals.filter((l) => !l.registered);
-
+  // Routes address runners by name, so each name must have exactly one row.
+  const names = new Set([...locals.map((l) => l.name), ...githubRunners.map((g) => g.name)]);
   const views: RunnerView[] = [];
-  const seen = new Set<string>();
-
-  for (const gh of githubRunners) {
-    const local = localByName.get(gh.name) ?? null;
-    views.push(makeView(gh.name, gh, local, opts.protectedNames));
-    seen.add(gh.name);
-  }
-
-  for (const [name, local] of localByName) {
-    if (seen.has(name)) continue;
-    // If GitHub was unreachable we cannot tell an orphan from a healthy runner, so
-    // do not accuse it of being one.
+  for (const name of names) {
+    const matchingLocals = locals.filter((l) => l.name === name);
+    const registrations = githubRunners.filter((g) => g.name === name);
+    const local = matchingLocals[0] ?? null;
+    const github = registrations.find((g) => g.busy) ?? registrations[0] ?? null;
+    const view = makeView(name, github, local, opts.protectedNames);
+    if (matchingLocals.some((l) => l.legacy)) view.protectedRunner = true;
     if (githubResult.status === 'rejected') {
-      views.push({
-        ...makeView(name, null, local, opts.protectedNames),
-        state: 'stopped',
-        detail: 'GitHub state unknown — showing local service state only.',
-      });
-    } else {
-      views.push(makeView(name, null, local, opts.protectedNames));
+      view.state = serviceState(local?.active);
+      view.detail = 'GitHub state unknown. Local service is ' + (local?.active ?? 'unknown') + '.';
     }
-    seen.add(name);
-  }
-
-  for (const local of unregisteredLocals) {
-    views.push(makeView(local.name, null, local, opts.protectedNames));
+    if (registrations.length > 1) {
+      view.detail += ' Multiple GitHub registrations share this name.';
+      view.actions.start = view.actions.stop = view.actions.restart = false;
+    }
+    if (githubResult.status === 'rejected' || matchingLocals.length > 1 || view.protectedRunner) {
+      view.actions = { start: false, stop: false, restart: false, delete: false };
+      if (matchingLocals.length > 1) view.detail += ' Multiple local instances share this name; manual cleanup required.';
+    }
+    views.push(view);
   }
 
   views.sort((a, b) => {
@@ -230,18 +246,20 @@ export async function buildInventory(
     return attention !== 0 ? attention : a.name.localeCompare(b.name);
   });
 
-  const used = locals.length;
+  const used = Math.max(locals.length, headroom.instances);
+  const limit = Math.min(opts.cap, headroom.cap);
   return {
     runners: views,
     headroom,
     cap: {
-      limit: opts.cap,
+      limit,
       used,
-      remaining: Math.max(0, opts.cap - used),
-      canCreate: used < opts.cap,
+      remaining: Math.max(0, limit - used),
+      canCreate: githubResult.status === 'fulfilled' && headroomResult.status === 'fulfilled' && used < limit,
     },
     target: registry.describe(),
     registrationUrl: registry.registrationUrl(),
+    githubAvailable: githubResult.status === 'fulfilled',
     warnings,
     fetchedAt: new Date().toISOString(),
   };
@@ -259,6 +277,8 @@ function makeView(
   const isProtected = protectedNames.includes(name) || Boolean(local?.legacy);
   const hasUnit = Boolean(local?.unit && local.serviceInstalled);
   const running = local?.active === 'active';
+  const stopped = serviceState(local?.active) === 'stopped';
+  const settled = !hasUnit || running || stopped;
 
   return {
     name,
@@ -268,11 +288,11 @@ function makeView(
     local,
     protectedRunner: isProtected,
     actions: {
-      start: !isProtected && hasUnit && !running,
-      stop: !isProtected && hasUnit && running,
-      restart: !isProtected && hasUnit,
+      start: !isProtected && !github?.busy && hasUnit && stopped,
+      stop: !isProtected && !github?.busy && hasUnit && running,
+      restart: !isProtected && !github?.busy && hasUnit && settled,
       // An orphan on either side must still be deletable — that is how it gets cleaned up.
-      delete: !isProtected && (Boolean(local) || Boolean(github)),
+      delete: !isProtected && !github?.busy && settled && (Boolean(local) || Boolean(github)),
     },
   };
 }

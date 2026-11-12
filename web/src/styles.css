@@ -12,13 +12,15 @@
   --page: #f9f9f7;
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
-  --text-muted: #898781;
+  --text-muted: #706e68;
+  --text-on-accent: #ffffff;
+  --text-critical: #d03b3b;
   --gridline: #e1e0d9;
   --baseline: #c3c2b7;
   --border: rgba(11, 11, 11, 0.1);
 
   --seq-track: #cde2fb;
-  --seq-fill: #2a78d6;
+  --seq-fill: #2673cf;
   --seq-strong: #184f95;
 
   --status-good: #0ca30c;
@@ -41,6 +43,8 @@
     --text-primary: #ffffff;
     --text-secondary: #c3c2b7;
     --text-muted: #898781;
+    --text-on-accent: #0d0d0d;
+    --text-critical: #ef7474;
     --gridline: #2c2c2a;
     --baseline: #383835;
     --border: rgba(255, 255, 255, 0.11);
@@ -428,7 +432,6 @@ main {
 
 .chip[data-auto='true'] {
   color: var(--text-muted);
-  opacity: 0.75;
 }
 
 /* ================================================================ badges */
@@ -508,7 +511,7 @@ button.btn:disabled {
 button.btn.primary {
   background: var(--seq-fill);
   border-color: var(--seq-fill);
-  color: #fff;
+  color: var(--text-on-accent);
 }
 
 button.btn.primary:hover:not(:disabled) {
@@ -517,7 +520,7 @@ button.btn.primary:hover:not(:disabled) {
 }
 
 button.btn.danger {
-  color: var(--status-critical);
+  color: var(--text-critical);
   border-color: color-mix(in srgb, var(--status-critical) 38%, var(--border));
 }
 
@@ -528,7 +531,7 @@ button.btn.danger:hover:not(:disabled) {
 button.link {
   border: none;
   background: none;
-  color: var(--seq-fill);
+  color: var(--seq-strong);
   padding: 0;
   cursor: pointer;
   font-size: inherit;
@@ -757,7 +760,7 @@ button.link {
 }
 
 .setting-row[data-mismatch='true'] .v {
-  color: var(--status-critical);
+  color: var(--text-critical);
   font-weight: 600;
 }
 
@@ -823,7 +826,7 @@ button.link {
 
 .audit-list .err {
   grid-column: 1 / -1;
-  color: var(--status-critical);
+  color: var(--text-critical);
   font-size: 0.78rem;
 }
 
@@ -913,7 +916,7 @@ dialog::backdrop {
 }
 
 .field .hint[data-error='true'] {
-  color: var(--status-critical);
+  color: var(--text-critical);
 }
 
 pre.logs {
@@ -936,6 +939,22 @@ pre.logs {
 }
 
 @media (max-width: 760px) {
+  .topbar-inner {
+    height: auto;
+    min-height: 3.4rem;
+    flex-wrap: wrap;
+    padding: 0.6rem 1rem;
+    gap: 0.5rem;
+  }
+  .target-chip { max-width: 100%; }
+  .whoami { margin-left: auto; }
+  .whoami > span {
+    max-width: 8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .settings-grid { grid-template-columns: minmax(0, 1fr); }
+
   .runner {
     grid-template-columns: 1fr;
   }

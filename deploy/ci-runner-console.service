@@ -20,6 +20,7 @@ EnvironmentFile=/etc/ci-runner-console.env
 
 Restart=always
 RestartSec=3
+TimeoutStopSec=330
 
 # This process holds an SSH key that reaches a machine which executes CI code, so
 # it gets the smallest surface the application can still work in.

@@ -16,6 +16,8 @@ interface Presentation {
 export const STATE: Record<RunnerState, Presentation> = {
   'orphan-github': { tone: 'critical', glyph: '✕', label: 'Orphan in GitHub', rank: 0 },
   'orphan-local': { tone: 'critical', glyph: '✕', label: 'Orphan on VM', rank: 0 },
+  'service-changing': { tone: 'warning', glyph: '◐', label: 'Service changing', rank: 1 },
+  'service-unknown': { tone: 'warning', glyph: '▲', label: 'Service unknown', rank: 1 },
   disconnected: { tone: 'warning', glyph: '▲', label: 'Disconnected', rank: 1 },
   'no-service': { tone: 'warning', glyph: '▲', label: 'No service', rank: 1 },
   unregistered: { tone: 'warning', glyph: '▲', label: 'Unregistered', rank: 1 },
@@ -28,6 +30,8 @@ export const ATTENTION_STATES: RunnerState[] = [
   'orphan-github',
   'orphan-local',
   'disconnected',
+  'service-changing',
+  'service-unknown',
   'no-service',
   'unregistered',
 ];

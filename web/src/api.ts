@@ -27,7 +27,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const text = await res.text();
-  const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = text ? JSON.parse(text) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+    body = parsed as Record<string, unknown>;
+  } catch {
+    throw new ApiError(`Invalid server response (${res.status}). Please retry.`, res.status);
+  }
 
   if (!res.ok) {
     throw new ApiError(

@@ -21,6 +21,10 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - name: Use runner temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:vm
       - run: npm run build

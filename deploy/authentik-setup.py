@@ -15,23 +15,19 @@ import sys
 import urllib.error
 import urllib.request
 
+if os.environ.get("ALLOW_AUTHENTIK_SETUP") != "1":
+    raise SystemExit("set ALLOW_AUTHENTIK_SETUP=1 to modify Authentik")
+
 BASE = os.environ["AUTHENTIK_URL"].rstrip("/") + "/api/v3"
 TOKEN = os.environ["AUTHENTIK_TOKEN"]
-REDIRECT_URI = os.environ.get(
-    "REDIRECT_URI", "https://ci-runners.christiannucifora.com/auth/callback"
-)
+REDIRECT_URI = os.environ["REDIRECT_URI"]
 APP_SLUG = os.environ.get("APP_SLUG", "ci-runners")
 APP_NAME = os.environ.get("APP_NAME", "CI Runners")
 GROUP_NAME = os.environ.get("GROUP_NAME", "CI Runners")
 MEMBER_PKS = [p for p in os.environ.get("MEMBER_PKS", "").split(",") if p]
 
-# The Authentik instance presents a self-signed certificate on its HTTPS port and
-# is reached over the LAN by IP, so verification is disabled for this setup script
-# only. The application itself talks to Authentik over its public HTTPS name with
-# normal certificate validation.
-CTX = ssl.create_default_context()
-CTX.check_hostname = False
-CTX.verify_mode = ssl.CERT_NONE
+# Trust the system CA store or an explicitly supplied private CA.
+CTX = ssl.create_default_context(cafile=os.environ.get("AUTHENTIK_CA_FILE"))
 
 
 def call(method, path, body=None):
@@ -46,12 +42,11 @@ def call(method, path, body=None):
         },
     )
     try:
-        with urllib.request.urlopen(req, context=CTX) as res:
+        with urllib.request.urlopen(req, context=CTX, timeout=30) as res:
             raw = res.read()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        raise SystemExit(f"{method} {path} -> HTTP {e.code}\n{detail}")
+        raise SystemExit(f"{method} {path} -> HTTP {e.code}")
 
 
 def first(results):
@@ -158,7 +153,7 @@ app_payload = {
     "provider": provider["pk"],
     "meta_description": "Manage self-hosted GitHub Actions runner instances on the CI VM.",
     "meta_launch_url": REDIRECT_URI.rsplit("/auth/callback", 1)[0],
-    "policy_engine_mode": "any",
+    "policy_engine_mode": "all",
 }
 if app is None:
     app = call("POST", "/core/applications/", app_payload)
@@ -186,5 +181,5 @@ issuer = f"{os.environ['AUTHENTIK_PUBLIC_URL'].rstrip('/')}/application/o/{APP_S
 print("\n--- values for the app's environment file ---")
 print(f"OIDC_ISSUER={issuer}")
 print(f"OIDC_CLIENT_ID={provider['client_id']}")
-print(f"OIDC_CLIENT_SECRET={provider['client_secret']}")
+print("OIDC_CLIENT_SECRET must be copied securely from the provider, omitted here")
 print(f"OIDC_ALLOWED_GROUPS={GROUP_NAME}")

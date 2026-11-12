@@ -81,7 +81,7 @@ export function SettingsView({ me }: { me: Me | null }) {
           ))}
           {checks === null ? (
             <div className="card">
-              <div className="empty">Running checks…</div>
+              <div className="empty">{error ? 'Checks unavailable. Use Re-check to retry.' : 'Running checks…'}</div>
             </div>
           ) : null}
         </div>
@@ -101,7 +101,7 @@ export function SettingsView({ me }: { me: Me | null }) {
                     {r.env ? <span className="env">{r.env}</span> : null}
                     {r.note ? <div className="note">{r.note}</div> : null}
                     {r.mismatch ? (
-                      <div className="note" style={{ color: 'var(--status-critical)' }}>
+                      <div className="note" style={{ color: 'var(--text-critical)' }}>
                         Does not match the console's own cap — the lower of the two applies.
                       </div>
                     ) : null}
@@ -176,6 +176,7 @@ function AuditSection({ entries }: { entries: AuditEntry[] }) {
             <option value="all">Any outcome</option>
             <option value="success">Success only</option>
             <option value="failure">Failures only</option>
+            <option value="pending">Unresolved only</option>
           </select>
           <input
             value={q}
@@ -184,7 +185,7 @@ function AuditSection({ entries }: { entries: AuditEntry[] }) {
             aria-label="Search the audit log"
           />
           <span style={{ marginLeft: 'auto', fontSize: '0.76rem', color: 'var(--text-muted)' }}>
-            Append-only · every mutation, including failures
+            Recorded runner mutations
           </span>
         </div>
 
@@ -204,10 +205,10 @@ function AuditSection({ entries }: { entries: AuditEntry[] }) {
                   {e.target ? ` → ${e.target}` : ''}
                   <span style={{ color: 'var(--text-muted)' }}> · {Math.round(e.durationMs)}ms</span>
                 </span>
-                <span className="badge" data-tone={e.outcome === 'success' ? 'good' : 'critical'}>
+                <span className="badge" data-tone={e.outcome === 'pending' ? 'warning' : e.outcome === 'success' ? 'good' : 'critical'}>
                   <span className="dot" aria-hidden="true" />
                   <span aria-hidden="true">{e.outcome === 'success' ? '✓' : '✕'}</span>
-                  {e.outcome}
+                  {e.outcome === 'pending' ? 'Unresolved: refresh runner state' : e.outcome}
                 </span>
                 {e.error ? <span className="err">{e.error}</span> : null}
               </li>

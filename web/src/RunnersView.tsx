@@ -13,25 +13,32 @@ interface Props {
   inventory: Inventory | null;
   me: Me | null;
   busy: string | null;
+  unavailable: boolean;
   onAction: (name: string, action: Action) => void;
   onDelete: (name: string) => void;
-  onCreate: (name: string, labels: string[]) => Promise<void>;
+  onCreate: (name: string, labels: string[]) => Promise<string | null>;
 }
 
-export function RunnersView({ inventory, me, busy, onAction, onDelete, onCreate }: Props) {
+export function RunnersView({ inventory, me, busy, unavailable, onAction, onDelete, onCreate }: Props) {
   const [adding, setAdding] = useState(false);
   const [logs, setLogs] = useState<{ name: string; lines: string[] } | null>(null);
   const [logError, setLogError] = useState<string | null>(null);
+  const logRequest = useRef(0);
+
+  useEffect(() => () => { ++logRequest.current; }, []);
 
   const groups = useMemo(() => groupRunners(inventory?.runners ?? []), [inventory]);
   const counts = useMemo(() => countStates(inventory?.runners ?? []), [inventory]);
 
   async function showLogs(name: string) {
+    const request = ++logRequest.current;
     setLogError(null);
     try {
       const { lines } = await api.logs(name);
+      if (request !== logRequest.current) return;
       setLogs({ name, lines });
     } catch (err) {
+      if (request !== logRequest.current) return;
       setLogError(err instanceof Error ? err.message : String(err));
     }
   }
@@ -108,7 +115,7 @@ export function RunnersView({ inventory, me, busy, onAction, onDelete, onCreate 
         <button
           className="btn primary"
           onClick={() => setAdding(true)}
-          disabled={!inventory.cap.canCreate || busy !== null}
+          disabled={!inventory.cap.canCreate || busy !== null || unavailable}
           title={
             inventory.cap.canCreate
               ? 'Register another runner instance on the CI VM'
@@ -132,6 +139,7 @@ export function RunnersView({ inventory, me, busy, onAction, onDelete, onCreate 
                   key={r.name}
                   runner={r}
                   busy={busy}
+                  unavailable={unavailable}
                   onAction={onAction}
                   onDelete={onDelete}
                   onLogs={showLogs}
@@ -154,13 +162,17 @@ export function RunnersView({ inventory, me, busy, onAction, onDelete, onCreate 
       {adding ? (
         <AddRunnerDialog
           inventory={inventory}
+          unavailable={unavailable}
           defaultLabels={me?.defaultLabels ?? []}
           onClose={() => setAdding(false)}
           onCreate={onCreate}
         />
       ) : null}
 
-      {logs ? <LogDialog name={logs.name} lines={logs.lines} onClose={() => setLogs(null)} /> : null}
+      {logs ? <LogDialog name={logs.name} lines={logs.lines} onClose={() => {
+        ++logRequest.current;
+        setLogs(null);
+      }} /> : null}
     </>
   );
 }
@@ -217,17 +229,19 @@ function countStates(runners: RunnerView[]) {
 function RunnerCard({
   runner: r,
   busy,
+  unavailable,
   onAction,
   onDelete,
   onLogs,
 }: {
   runner: RunnerView;
   busy: string | null;
+  unavailable: boolean;
   onAction: (name: string, action: Action) => void;
   onDelete: (name: string) => void;
   onLogs: (name: string) => void;
 }) {
-  const anyBusy = busy !== null;
+  const anyBusy = busy !== null || unavailable;
   const tone = STATE[r.state].tone;
   const attention = ATTENTION_STATES.includes(r.state) && !r.protectedRunner;
 
@@ -313,19 +327,22 @@ function RunnerCard({
 
 function AddRunnerDialog({
   inventory,
+  unavailable,
   defaultLabels,
   onClose,
   onCreate,
 }: {
   inventory: Inventory;
+  unavailable: boolean;
   defaultLabels: string[];
   onClose: () => void;
-  onCreate: (name: string, labels: string[]) => Promise<void>;
+  onCreate: (name: string, labels: string[]) => Promise<string | null>;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const [name, setName] = useState('');
   const [labels, setLabels] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     ref.current?.showModal();
@@ -345,26 +362,30 @@ function AddRunnerDialog({
   };
 
   return (
-    <dialog ref={ref} onCancel={close} onClose={onClose}>
+    <dialog ref={ref} aria-labelledby="add-runner-title" onCancel={(e) => {
+      e.preventDefault();
+      if (!submitting) close();
+    }} onClose={onClose}>
       <form
         method="dialog"
         onSubmit={async (e) => {
           e.preventDefault();
-          if (problem || !name || submitting) return;
+          if (problem || !name || submitting || unavailable || !inventory.cap.canCreate) return;
           setSubmitting(true);
           try {
-            await onCreate(
+            const failure = await onCreate(
               name,
               labels.split(',').map((s) => s.trim()).filter(Boolean),
             );
-            close();
+            if (failure) setError(failure);
+            else close();
           } finally {
             setSubmitting(false);
           }
         }}
       >
         <div className="dialog-head">
-          <h3>Add a runner</h3>
+          <h3 id="add-runner-title">Add a runner</h3>
           <p>
             Registers a new instance on the CI VM and waits for GitHub to report it online.{' '}
             {inventory.cap.remaining} slot{inventory.cap.remaining === 1 ? '' : 's'} remaining.
@@ -372,6 +393,8 @@ function AddRunnerDialog({
         </div>
 
         <div className="dialog-body">
+          {error ? <Banner tone="critical">{error}</Banner> : null}
+          {unavailable ? <Banner tone="warning">Refresh runner state before creating an instance.</Banner> : null}
           <div className="field">
             <label htmlFor="rname">Name</label>
             <input
@@ -383,8 +406,9 @@ function AddRunnerDialog({
               autoFocus
               disabled={submitting}
               aria-invalid={Boolean(problem)}
+              aria-describedby="rname-hint"
             />
-            <span className="hint" data-error={Boolean(problem)}>
+            <span id="rname-hint" className="hint" data-error={Boolean(problem)}>
               {problem ?? 'Must be unique across the target.'}
             </span>
           </div>
@@ -411,7 +435,7 @@ function AddRunnerDialog({
           <button type="button" className="btn" onClick={close} disabled={submitting}>
             Cancel
           </button>
-          <button className="btn primary" type="submit" disabled={submitting || !name || Boolean(problem)}>
+          <button className="btn primary" type="submit" disabled={submitting || unavailable || !inventory.cap.canCreate || !name || Boolean(problem)}>
             {submitting ? 'Creating…' : 'Add runner'}
           </button>
         </div>
@@ -430,9 +454,9 @@ function LogDialog({ name, lines, onClose }: { name: string; lines: string[]; on
     onClose();
   };
   return (
-    <dialog ref={ref} onCancel={close} onClose={onClose}>
+    <dialog ref={ref} aria-labelledby="runner-log-title" onCancel={close} onClose={onClose}>
       <div className="dialog-head">
-        <h3>{name}</h3>
+        <h3 id="runner-log-title">{name}</h3>
         <p>Last {lines.length} lines from the runner's systemd service.</p>
       </div>
       <div className="dialog-body">

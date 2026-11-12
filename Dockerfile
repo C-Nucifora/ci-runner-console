@@ -20,6 +20,8 @@ FROM node:22-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
+# Container publishing requires an explicit wildcard bind inside the container.
+ENV HOST=0.0.0.0
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
  && npm cache clean --force
@@ -29,8 +31,9 @@ COPY --from=build /app/web/dist ./web/dist
 
 # The audit log is the only path this process writes to.
 RUN mkdir -p /var/lib/ci-runner-console \
- && chown -R node:node /var/lib/ci-runner-console /app
+ && chown node:node /var/lib/ci-runner-console
 
+STOPSIGNAL SIGTERM
 USER node
 EXPOSE 8080
 
