@@ -187,7 +187,7 @@ export async function audited<T>(
     try {
       await log.record({
         ...entry, at: new Date().toISOString(), outcome: 'failure',
-        error: 'Operation failed', durationMs: Date.now() - started,
+        error: 'Operation failed', durationMs: Math.max(0, Date.now() - started),
       });
     } catch {
       const state = err instanceof Error ? (err as Error & { operationState?: string }).operationState : undefined;
@@ -198,7 +198,7 @@ export async function audited<T>(
   try {
     await log.record({
       ...entry, at: new Date().toISOString(), outcome: 'success',
-      durationMs: Date.now() - started,
+      durationMs: Math.max(0, Date.now() - started),
     });
   } catch {
     throw new AuditWriteError('completed');
