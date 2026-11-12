@@ -17,7 +17,7 @@ STAGE=$(mktemp -d)
 REMOTE_STAGE=''
 cleanup() {
   rm -rf -- "$STAGE"
-  if [[ -n "$REMOTE_STAGE" ]]; then
+  if [[ "$REMOTE_STAGE" =~ ^/tmp/crc-stage\.[a-zA-Z0-9]{10}$ ]]; then
     ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "rm -rf -- '$REMOTE_STAGE'" || true
   fi
 }
