@@ -8,17 +8,22 @@ export async function boundedFetch(url: Parameters<typeof fetch>[0], init?: Para
   const response = await fetch(url, { ...init, signal, redirect: 'error' });
   const reader = response.body?.getReader();
   if (!reader) return response;
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}); };
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
+      signal.throwIfAborted();
       if (done) break;
       size += value.byteLength;
       if (size > MAX_RESPONSE_BYTES) throw new Error('HTTP response exceeds size limit');
       chunks.push(value);
     }
   } finally {
+    signal.removeEventListener('abort', abort);
     try { await reader.cancel(); } finally { reader.releaseLock(); }
   }
   return new Response(Buffer.concat(chunks), {
