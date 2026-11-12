@@ -158,11 +158,8 @@ async function main() {
     // Allow bounded SSH actions to finish; durable audit intents survive a forced exit.
     const deadline = setTimeout(() => process.exit(1), 300_000);
     deadline.unref();
-    void app.close().then(() => {
-      clearTimeout(deadline);
-      process.removeListener('SIGTERM', shutdown);
-      process.removeListener('SIGINT', shutdown);
-    }).catch((err) => {
+    // Disconnected requests can keep working after HTTP closure resolves.
+    void app.close().catch((err) => {
       app.log.error(err, 'shutdown failed');
       process.exit(1);
     });

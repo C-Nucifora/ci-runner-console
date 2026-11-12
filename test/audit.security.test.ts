@@ -121,7 +121,7 @@ test('torn audit boundary failures prevent side effects and allow a durable retr
         ? t.mock.method(prototype, 'read', async () => { throw new Error('synthetic read failure'); })
         : phase === 'sync'
           ? t.mock.method(prototype, 'sync', async function (this: FileHandle) {
-            if (++syncs === 2) throw new Error('synthetic fsync failure');
+            if ((await this.stat()).isFile() && ++syncs === 2) throw new Error('synthetic fsync failure');
             return originalSync.call(this);
           })
           : t.mock.method(prototype, 'writeFile', async function (this: FileHandle,

@@ -1,6 +1,6 @@
 import { mkdir, open } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Identity } from './auth/session.js';
@@ -41,19 +41,11 @@ export class AuditWriteError extends Error {
 
 /** JSONL written in append mode. Filesystem permissions remain the integrity boundary. */
 export class AuditLog {
-  #ready: Promise<void> | null = null;
   #writes: Promise<void> = Promise.resolve();
   #pendingWrites = 0;
+  #directoriesSynced = false;
 
   constructor(private readonly path: string) {}
-
-  async #ensureDir(): Promise<void> {
-    this.#ready ??= mkdir(dirname(this.path), { recursive: true }).then(() => undefined).catch((err) => {
-      this.#ready = null;
-      throw err;
-    });
-    return this.#ready;
-  }
 
   async record(entry: AuditEntry): Promise<void> {
     // Snapshot before queuing so a caller cannot change a pending record.
@@ -72,7 +64,7 @@ export class AuditLog {
     if (this.#pendingWrites >= 64) throw new Error('Audit write backlog is full');
     this.#pendingWrites++;
     const write = this.#writes.then(async () => {
-      await this.#ensureDir();
+      if (!this.#directoriesSynced) await mkdir(dirname(this.path), { recursive: true });
       const handle = await open(this.path, constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
       try {
         const info = await handle.stat();
@@ -87,6 +79,20 @@ export class AuditLog {
         }
         await handle.writeFile(content);
         await handle.sync();
+        // Retry the full ancestor chain until even partially created trees are durable.
+        let directory = resolve(dirname(this.path));
+        do {
+          const dirHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+          try {
+            await dirHandle.sync();
+          } finally {
+            await dirHandle.close();
+          }
+          const parent = dirname(directory);
+          if (this.#directoriesSynced || parent === directory) break;
+          directory = parent;
+        } while (true);
+        this.#directoriesSynced = true;
       } finally {
         await handle.close();
       }

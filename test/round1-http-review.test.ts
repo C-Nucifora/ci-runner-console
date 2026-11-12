@@ -184,7 +184,7 @@ test('review: a blocked fsync prevents effects while preserving torn non-UTF-8 b
   let syncs = 0;
   let effects = 0;
   const mock = t.mock.method(prototype, 'sync', async function (this: FileHandle) {
-    if (++syncs === 2) { entered(); await gate; }
+    if ((await this.stat()).isFile() && ++syncs === 2) { entered(); await gate; }
     return originalSync.call(this);
   });
   const operation = audited(f.log, { identity, action: 'runner.stop', requestId: 'blocked-sync' }, async () => {
