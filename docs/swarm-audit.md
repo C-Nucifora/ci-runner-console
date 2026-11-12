@@ -32,7 +32,7 @@ The parent published the five preserved, verified commits through `3f8c4ec` to `
 
 ## Round 1
 
-Status: resumed by the user after the verified checkpoint. Two fresh independent reviewers are challenging the HTTP/audit implementation and the parent VM/state follow-ups. Parent checkpoint checks passed as recorded below. Round one is not independently closed yet.
+Status: round one integrated after independent breaker, fixer and follow-up review work. All reproduced findings have verified fixes. The final clock correction follows the independent reviewer's minimal fix and passes its unchanged regressions. Round two will challenge the final corrections alongside new lifecycle and shutdown sequences. No clean-round streak is credited yet because the follow-up reviews continued to reveal substantive defects.
 
 Results, regression commands, fixes, independent objections and published commit IDs will be recorded as evidence arrives.
 
@@ -74,7 +74,7 @@ Executed under the shared lock with the designated TMPDIR: `node --import tsx --
 
 ## Deferred work
 
-The user requested a checkpoint and pause on 2026-11-12, then explicitly resumed the extended goal. The three-round minimum and two consecutive clean rounds have not been reached. Round 1 does not yet count as independently closed; rounds 2 and 3 have not started. The following priorities remain approved.
+The user requested a checkpoint and pause on 2026-11-12, then explicitly resumed the extended goal. The three-round minimum and two consecutive clean rounds have not been reached. Round 1 has completed with findings and verified fixes; rounds 2 and 3 remain required. The following priorities remain approved.
 
 
 Round 2 will emphasize cross-request lifecycle, concurrency, partial failures and durable audit/shutdown recovery. Round 3 will emphasize browser/operator sequences, configuration/deployment boundaries and challenges near earlier fixes. Findings may change these priorities, but cannot remove required matrix coverage or substitute old tests for new experiments. Count a clean round only after its fresh independent challenge completes; record any remaining acceptance limits explicitly.
@@ -129,3 +129,38 @@ The checkpoint push succeeded through `0c88cd9`, with a clean worktree and four 
 R1-C01, medium: the checkpoint's new job-level environment used a context unavailable at that scope. Set `TMPDIR` through a step using the standard `RUNNER_TEMP` environment variable and `GITHUB_ENV` instead. Workflow validation uses actionlint 1.7.12, whose downloaded archive was verified against its published SHA-256 digest. Actionlint passed against the corrected workflow, and `git diff --check` passed. This changes only CI temporary-directory setup; no deployment, credentials, branch triggers or action pins change.
 
 The latest user instruction resumes the unfinished rounds. Fresh independent HTTP/audit and VM/state review tasks are running with separate test-file ownership and the shared heavy-job lock. No earlier refused testing subtask is being retried.
+
+### Fresh VM/state follow-up
+
+The fresh independent reviewer signed off on R1-P01/P02 within the synthetic API/reconciliation scope. Seven new state/API tests passed, including twelve rejected mutation requests before token or VM mutation calls. Test compilation passed. New VM experiments passed five cases and failed three assertions across two cases, with source unchanged from the checkpoint:
+
+| ID | Severity | Reproduction and expected behavior | Root cause | Response |
+| --- | --- | --- | --- | --- |
+| R1-V05 | Medium | Inject `realpath` failure for one of two existing instances; inventory must fail and capacity must retain both | Enumeration treats failed path inspection as absence | Capacity counting retains direct instance directories; inventory and buffered instance lookup propagate path-inspection failure; create refuses uncertain discovery |
+| R1-V06 | Low | Two verified service bindings must not produce successful direct status with a null unit | Direct status discards `unit_for` errors | Preserve genuine absence, reject ambiguity and inspection failures |
+
+The parent made bounded follow-up changes and extended the capacity regression to cover create both below and at the cap. The independent source review found no substantive objection, and parent execution passed all 69 Python boundary tests plus seven state/API follow-up tests. The application does not consume direct status, but the forced-command interface exposes it.
+
+Hosted CI succeeded on `75f5bc9`: [run 43121341319](https://github.com/C-Nucifora/ci-runner-console/actions/runs/43121341319). Installation, typecheck, Node tests, all Python VM suites and production build passed on GitHub's Ubuntu runner with Node 24. This validates the workflow correction; it does not cover subsequent uncommitted review fixes.
+
+The next independent discovery reviewer found no substantive source defect in R1-V05/V06 or their callers. It added seven cases covering every lookup caller, early/late inspection failures, redirected/legacy paths, symlinks, invalid directory names, cap boundaries, status absence/stale hints, second-inspection failures and unrelated ambiguity. Both of its lock waits expired before execution; zero tests ran in that worker. Parent execution subsequently passed all seven preserved cases as part of the complete 69-test VM run. No additional production change was requested.
+
+### Fresh HTTP/audit follow-up
+
+The independent review passed seven new probes for decoded gzip limits, bodyless responses, caller aborts, reader cleanup, HTTP-error rejection/redaction, split UTF-8 audit rows and fsync ordering. It reproduced R1-A04, medium: a 250 ms backward wall-clock adjustment writes a negative duration in either outcome branch; strict reader validation hides that outcome and displays the pending intent instead. Both subcases failed, with TAP totals of seven passes and three failures including their parent group.
+
+The parent clamps elapsed durations to zero in both branches. Reader validation remains strict. The review's successful/failing operation regressions remain unchanged; combined verification is pending. No other substantive HTTP/audit objection emerged. The reviewer's separate compilation attempts expired waiting for the shared lock, so they are not counted as executed checks.
+
+VM follow-up verification exited zero under the shared lock: shell syntax, all five Python boundary suites with 69 total tests, and seven state/API follow-up tests. Evidence: `crc-round1-vm-followup-fixed.log` in the designated TMPDIR. Signed commit `a5f6391` preserves the VM changes and independent regressions and was pushed with its remote hash verified. The audit-duration correction is signed commit `ed8b1aa`.
+
+### Round-one integration result
+
+Final combined verification passed: 219 Node tests with zero failures, cancellations or skips; production typecheck; test compilation; server and web production builds. The separate complete VM run passed 69 Python tests and seven state/API follow-up tests. The independent HTTP review's two backward-clock regressions now preserve success/failure outcomes with nonnegative durations. Full log: `crc-round1-integration-final.log` under the designated TMPDIR. No further browser run was needed for these audit/controller-only follow-ups; the latest frontend revision retains its 40 passing assertions at both desktop and mobile widths.
+
+Independent scope: the state/API review signed off; the discovery follow-up found no substantive source issue and its seven preserved cases passed under parent execution; the HTTP/audit review found only the clock-duration defect, corrected exactly as requested and verified without relaxing reader validation. Some direct lookup error text still says "no such runner" after inspection failure, but returns failure and is never interpreted as authoritative absence by callers. This is recorded as a diagnostic limitation, not a destructive-cleanup exception.
+
+No known reproduced defect from round one remains unresolved. The accepted busy-job race and unavailable live acceptance remain explicit limits. Fresh challenge of the final corrections is carried into round two; the required three-round minimum and two-round clean streak are not yet met.
+
+## Round 2
+
+Status: starting after publication of round-one fixes. Two independent breakers will own separate regression files. One will challenge lifecycle interleavings, duplicate/cap races, cancellation and partial recovery. The other will challenge process shutdown, durable intent/outcome ordering and resource limits, including the clock-duration correction. Both must identify new bounded sequences beyond the existing suites and preserve earlier findings, fixes and acceptance limits in their review. Source reads remain lightweight; executable checks are batched under the shared lock.
