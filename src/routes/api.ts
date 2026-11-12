@@ -440,7 +440,7 @@ export function registerApiRoutes(
 }
 
 async function waitForGitHub(registry: RunnerRegistry, name: string, timeoutMs: number, checkActive: () => void) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   while (true) {
     checkActive();
     const runners = await registry.listRunners();
@@ -448,8 +448,8 @@ async function waitForGitHub(registry: RunnerRegistry, name: string, timeoutMs: 
     const matches = runners.filter((runner) => runner.name === name);
     if (matches.length > 1) throw new Error('Multiple GitHub registrations share this name');
     const found = matches[0];
-    if (found?.status === 'online' || Date.now() >= deadline) return found ?? null;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(3000, deadline - Date.now())));
+    if (found?.status === 'online' || performance.now() >= deadline) return found ?? null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(3000, deadline - performance.now())));
   }
 }
 

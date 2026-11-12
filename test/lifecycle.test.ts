@@ -427,11 +427,11 @@ test('confirmation failure or cancellation preserves a completed create and repo
 test('offline registration at confirmation deadline never reports online', async (t) => {
   const f = await fixture(t);
   const list = f.registry.listRunners.bind(f.registry);
-  const now = Date.now();
+  const now = performance.now();
   f.registry.listRunners = async () => {
     if (f.state.locals.length) {
       f.state.runners[0]!.status = 'offline';
-      t.mock.method(Date, 'now', () => now + 120_000);
+      t.mock.method(performance, 'now', () => now + 120_000);
     }
     return list();
   };
