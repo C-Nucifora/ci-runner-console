@@ -51,8 +51,9 @@ async function fixture(options: { wrongHostKey?: boolean } = {}) {
     registryCalls: [] as string[], authentications: 0, fault: null as Fault | null,
     hold: null as null | { operation: string; entered: ReturnType<typeof deferred<void>>; release: ReturnType<typeof deferred<void>> },
   };
-  const host = utils.generateKeyPairSync('ed25519');
-  const client = utils.generateKeyPairSync('ed25519');
+  // ssh2 strips leading zero bytes from generated Ed25519 public keys.
+  const host = utils.generateKeyPairSync('ecdsa', { bits: 256 });
+  const client = utils.generateKeyPairSync('ecdsa', { bits: 256 });
   const parsedClient = utils.parseKey(client.private);
   assert.ok(!(parsedClient instanceof Error));
   const server = new Server({ hostKeys: [host.private] }, (connection) => {
