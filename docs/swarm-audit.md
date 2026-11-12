@@ -164,3 +164,116 @@ No known reproduced defect from round one remains unresolved. The accepted busy-
 ## Round 2
 
 Status: starting after publication of round-one fixes. Two independent breakers will own separate regression files. One will challenge lifecycle interleavings, duplicate/cap races, cancellation and partial recovery. The other will challenge process shutdown, durable intent/outcome ordering and resource limits, including the clock-duration correction. Both must identify new bounded sequences beyond the existing suites and preserve earlier findings, fixes and acceptance limits in their review. Source reads remain lightweight; executable checks are batched under the shared lock.
+
+### Round-two lifecycle triage
+
+The independent lifecycle breaker compiled its focused test and ran 21 new cases in one lock acquisition: 20 passed, one failed. Successful probes cover delayed overlap rejection, post-token capacity disagreement, changing duplicate identities, GitHub outages at six removal phases, lost deletion acknowledgement, revocation/cancellation and uncertain-service recovery. Evidence: `crc-round2-lifecycle.log` under the designated TMPDIR.
+
+R2-L01, medium: moving the wall clock backward one hour during create confirmation extends its 60-second polling deadline and holds the global mutation slot. The bounded regression reached 63 synthetic seconds and 22 reads before its guard stopped the broken loop. VM creation remains recoverable and its response still identifies completed local work. The parent changes deadline/expiry/sleep calculations to `performance.now()`, retaining wall-clock timestamps for audit history. The existing offline-deadline test now advances the monotonic clock; the new regression also covers a forward correction and requires the full intended polling budget. Focused verification and independent review remain pending.
+
+Hosted CI passed for the complete round-one publication `ce70d9e`: [run 43126311389](https://github.com/C-Nucifora/ci-runner-console/actions/runs/43126311389).
+
+### Round-two audit/shutdown triage
+
+The independent breaker added `test/round2-process-audit.test.ts`. Initial strict compilation passed; its 20-test run had 18 passes and two directory-durability failures. Refining the disconnect client to an unpooled HTTP connection exposed two additional failures that the pooled client masked. Both refined cases compiled and failed as intended. Logs are `crc-round2-process-audit-ce70d9e.log` and `crc-round2-process-disconnect-ce70d9e.log` in the designated TMPDIR. All fixtures were cleaned up.
+
+| ID | Severity | Reproduction and expected behavior | Root cause | Response |
+| --- | --- | --- | --- | --- |
+| R2-A01 | Medium | New audit file/ancestor directories dispatch after file fsync without required directory fsync; persist directory entries first | Only file contents are synchronized | Separate fixer assigned directory durability and failure/retry coverage |
+| R2-P01 | Medium | Unpooled client disconnects during mutation or outcome write; child outlives a shortened 150 ms deadline by more than 750 ms | HTTP close resolves before detached work and clears the watchdog/handlers | Separate fixer assigned retaining the unreferenced watchdog until process exit |
+
+Sixteen unchanged probes passed for initial storage recovery, descriptor cleanup, backlog pressure in both outcome branches, backward ISO timestamps, repeated signals, forced deadlines, SIGKILL, torn outcomes and restart recovery. Directory ordering proves missing synchronization, not actual host power-loss data loss. Shortened fixture timers do not certify the full production or native systemd deadlines. No live acceptance was performed.
+
+### Independent lifecycle timing review
+
+Fresh source review found no new substantive defect in R2-L01. All deadline calculations use the monotonic clock, and the regressions keep session expiry separate from confirmation timing. The reviewer added seven probes in `test/round2-lifecycle-review.test.ts`: a slow inventory read leaves a 1,250 ms final sleep with online/offline/absent outcomes; revocation and disconnect during reads or sleeps preserve completed creation and release the mutation slot. These probes have not yet been compiled or executed. Scoped whitespace review passed.
+
+The 60-second confirmation budget is a polling deadline, not a hard response deadline. An in-flight bounded inventory read can finish after it expires; cancellation is checked after reads and sleeps. That behavior predates the timing fix and remains an explicit limit. Parent execution and combined round-two review are pending.
+
+Lifecycle focused verification passed after acquiring the shared lock: strict compilation of `test/round2-lifecycle.test.ts` and `test/lifecycle.test.ts`, followed by 47 tests with zero failures, cancellations or skips in 5.18 seconds. This includes both backward and forward clock corrections, the original offline-deadline case and the breaker state sequences. Evidence: `crc-round2-lifecycle-fixed.log` under the designated TMPDIR. The seven fresh review probes were added after that command was queued and remain pending in the combined batch.
+
+### Audit and shutdown implementation
+
+The separate fixer syncs audit file contents, the containing directory and uncached ancestors before dispatch. Initial failures retry the complete ancestor chain; file and directory descriptors close on errors. After initialization, appends still sync the containing directory to cover audit-file recreation. The shutdown handler keeps its unreferenced watchdog and signal handlers after HTTP closure, since disconnected work may still be active. Normal exit remains possible when no referenced work remains. Existing fsync failure mocks now distinguish files from directories, retaining their original intent-file assertions.
+
+Focused strict compilation and 115 tests passed, including directory sync/close failure, same-writer/reopened recovery, cached readiness, repeated writes, disconnected requests, restart evidence, forced deadlines and normal shutdown. Whitespace checks passed. Evidence: `crc-round2-fixer-check.log` under the designated TMPDIR. Full integration, the seven lifecycle review probes and fresh independent audit/shutdown review remain pending. Actual power loss and the full production watchdog duration were not exercised.
+
+### Fresh audit and shutdown review
+
+Independent source review supports R2-A01 and R2-P01 with no new substantive finding. Directory error cleanup, full-chain retry and cached ancestor handling remain correct in the reviewed diff; the shutdown watchdog and handlers survive HTTP closure. Round-one audit protections remain intact. The reviewer added eight probes across `test/round2-audit-review.test.ts` and `test/round2-shutdown-review.test.ts` for blocked directory sync, directory-open failure, descriptor cleanup, ancestor retry, repeated signals after HTTP closure, natural drain and deadline expiry.
+
+The reviewer waited 45 seconds for the shared lock, then exited 75 without compiling or running tests. Whitespace checks passed. The parent's full serial integration batch remains queued and will include these new files along with the seven lifecycle review probes. No executable signoff or clean-round credit is claimed before those results. Evidence: `crc-round2-independent-review.log` under the designated TMPDIR.
+
+### Integration fixture correction
+
+The full round-two batch passed production/test compilation and ran 292 Node tests: 290 passed and two failed before opening SSH fixtures. Both failures were `Cannot parse privateKey: Malformed OpenSSH private key` from `new ssh2.Server`, while consuming keys generated immediately beforehand. The dependency's Ed25519 generator strips every leading zero byte from the DER public bit string; its parser correctly requires a 32-byte Ed25519 public key. Thus a randomly generated leading-zero key breaks setup. The application does not generate these keys.
+
+R2-T01, low: generated fixture keys intermittently invalidate SSH integration/process checks. The parent switches those synthetic generated keys to ECDSA P-256, whose uncompressed public point starts with the required nonzero format byte. No transport, host-key mismatch, token, failure/retry, shutdown or lifecycle assertion is removed or relaxed. Existing configuration coverage still uses Node-generated Ed25519 public keys. A bounded generator probe and full rerun are pending. The build was not reached because the test command failed. All fifteen new independent review probes passed in this first integration run. Evidence: `crc-round2-integration.log` under the designated TMPDIR.
+
+### Round-three preparation during resource wait
+
+While the round-two rerun waits for the shared test slot, independent lightweight preparation covers deployment inputs and browser/operator state sequences. Draft files use a `.pending` suffix so they are neither compiled nor executed by round-two checks. This preparation does not count as a completed audit round.
+
+The deployment reviewer prepared six test methods with 22 scenarios. The parent inspected the strict fake PATH, SSH argument allowlist, discarded remote installation heredoc and live-e2e refusal environment. The probes never forward a command to a real remote shell; they check sequencing rather than deployed package contents. The parent removed an unnecessary HOME override from the fixture. One source hypothesis remains unconfirmed: nonzero SSH staging output may reach cleanup before validation. It will be reproduced or disproved after round-two publication. No deployment or live acceptance is authorized by these probes.
+
+The operator reviewer prepared eight separately selectable probes in `test/round3-browser-regression.js.pending`. They challenge out-of-order inventory success/error/refusal, late log selection/dismissal, log refusal retry, create network failure/retry and mutation refusal. The parent reviewed their fetch allowlist, loopback/original-fixture checks, response gates and cleanup. Each probe requires a fresh fixture reload; setup errors are reported separately from failed behavior assertions. Two source hypotheses concern unsequenced inventory and log completions. Neither is confirmed before browser execution. The draft does not establish 401 navigation or native keyboard coverage.
+
+The generator probe deterministically supplied a 32-byte Ed25519 DER public value beginning with zero, observed a 31-byte SSH value and the expected private-key parse refusal. All 128 generated ECDSA pairs parsed as public and private keys. The full rerun no longer failed SSH setup, but the existing OIDC stalled-body deadline regression exceeded its ten-second parent watchdog during discovery. This is a new unresolved integration failure; no fixture or production cause is assigned yet. Independent timeout/cleanup reproduction is required before publication. The production build again was not reached. Evidence: `crc-round2-integration-rerun.log`.
+
+The timeout rerun totals were 286 passes, four failures and two cancellations. Later deadline subtests report `parentAlreadyFinished` after the discovery stalled-body case; they are not separate root causes. All work is preserved while one independent worker isolates native-fetch signal lifetime, deadline and cleanup behavior on Node 22.22.1. No production timeout change or weakened assertion has been made.
+
+### Reviewed local commits while timeout investigation continues
+
+The parent fetched `origin` and rechecked the branch's last push at 2026-11-12 10:18:03 AEST, still `ce70d9e`. A subsequent read-only GitHub repository-events query returned no matching topic-branch push, so the remote-tracking reflog remains the timestamp evidence. Three local commits preserve independently reviewed changes whose affected checks passed in the integration runs:
+
+- `ee22f9f`: monotonic confirmation deadline and lifecycle/interleaving review regressions.
+- `0a7da1b`: directory durability, disconnected shutdown protection and independent fault probes.
+- `c238bfb`: valid generated SSH fixture keys, preserving transport assertions.
+
+All three use configured SSH signing; signatures were verified with a temporary allowed-signers file. Messages follow the lowercase eight-word rule, with chronological timestamps between 11:16:41 and 11:31:06 AEST. They remain local. Push is withheld pending the unresolved OIDC deadline and a passing full batch. Draft round-three probes and this ledger remain outside those commits.
+
+## Round 3
+
+The parent allows independent execution to overlap the unresolved round-two HTTP investigation. Deployment and frontend source are unchanged by round-two fixes; this avoids leaving reviewed probes idle behind an unrelated failure. Round-two publication still requires a green integration batch. The earlier publication-before-execution plan is superseded; no round is counted complete early.
+
+The parent reviewed and activated both independent drafts. A single shared-lock batch runs the six deployment test methods, checks browser JavaScript syntax, then starts the existing frontend-only fixture with an ephemeral explicit loopback port. A five-minute process timeout bounds the browser fixture lifetime after lock acquisition. The deployment probes use strict fake executables and never execute remote installation text or read credentials. Browser checks use fresh fixture reloads and synthetic fetch responses. Existing host listeners were inspected and remain untouched. Results and hypotheses will be triaged separately from harness failures.
+
+### Confirmed timeout defect
+
+R2-H01, medium: the independent worker reproduced a native-fetch abort-propagation failure under bounded forced GC on Node 22.22.1. Undici finalized its internal request controller and removed the source-signal listener while `boundedFetch` awaited its body. A strongly retained timeout still fired, but reading remained pending until the owned fixture closed. The no-GC control passed and the GC regression failed. This proves a production-path defect; the earlier uninstrumented integration occurrence cannot be attributed retrospectively with certainty.
+
+The worker's scratch candidate passed all 40 selected checks, including response bounds, redirects, caller aborts, cleanup and claims. Parent integration applies the suggested five-line fix: directly cancel the reader on abort, throw the signal reason after reads and remove the listener during cleanup. Independent challenge and full integration remain required. Evidence: `crc-http-timeout-probe/findings.md`, the failing regression and candidate logs under the designated TMPDIR.
+
+### Round-three reproductions and triage
+
+The deployment suite executed six test methods in 5.21 seconds. Five methods passed; two subcases in the sixth failed, covering 22 total scenarios. The browser ran eight probes at each of 1280×800 and 320×812: 58 assertions passed and 14 failed, with zero harness errors or unexpected application fetches. All three recovery-only probes passed at both widths. The fixture bound only `127.0.0.1:5173`; T3 accessed it through its localhost tunnel. The parent allowed that verified loopback tunnel name in the probe guard. The owned tab closed, fixture PID 1482503 received SIGTERM, its session exited 143, and the listener was confirmed absent.
+
+| ID | Severity | Reproduction and expected behavior | Root cause | Response |
+| --- | --- | --- | --- | --- |
+| R3-D01 | High | Failed SSH staging returns an arbitrary path or shell metacharacters; cleanup must never use unvalidated stdout | `set -e` invokes EXIT before the later validation, while the trap accepts any nonempty stage | Parent restricts cleanup to the exact staging-path allowlist; regression and independent challenge pending |
+| R3-U01 | Medium | Resolve newer inventory or refusal before older success/error; latest state and controls must remain authoritative | Every refresh completion writes state without request ordering | Separate UI fixer assigned |
+| R3-U02 | Low | Resolve older log selection after a newer selection or dismissal; preserve selected logs and keep dismissed dialog closed | Log completions ignore later selections and dismissal | Separate UI fixer assigned |
+
+The deployment fixture captured the constructed cleanup commands but never executed them. UI failures do not demonstrate an API authorization bypass; server-side guards remain required. Browser results are saved in `crc-round3-browser-before.json`; shell results in `crc-round3-deployment-before.log`. The shared design router is unavailable, so the UI work is limited to behavior within the existing interface. No new branding or layout decision is needed.
+
+### Round-two and round-three integration review
+
+The independent HTTP/deployment reviewer found no new substantive source defect. Ten new HTTP probes challenge abort ordering, rejected cancellation, listener cleanup and combined signals under GC. Four deployment methods cover thirty strict-fake scenarios near the staging allowlist and failure paths. The reviewer's shared-lock wait expired before execution; the parent includes both files in the next combined serial batch. Source signoff alone does not close these findings.
+
+The UI fixer restricts inventory and log completions to the latest request generation. Cleanup and dialog dismissal invalidate pending requests. Mutation controls wait for a newer pending reconciliation refresh before becoming available. It changed only the two components; original browser assertions remain unchanged. Focused whitespace review passed, but the worker could not acquire the test lock. Fresh independent review is preparing nearby mutation, log-error and navigation probes.
+
+The parent rechecked the intended origin, configured signing and last topic push at 10:18:03 AEST. Fetch showed no incoming master commits beyond the current branch. GitHub still reports only the CI workflow and zero hooks. Existing public host listeners are unchanged; no test service is running. One combined lock acquisition is queued for production/test compilation, serial Node/Python suites, build and syntax checks. While it waits, a second lightweight worker prepares inactive round-four boundary probes; preparation does not count as execution or a clean round.
+
+### Round-two and round-three verified completion
+
+The combined batch passed production/frontend typecheck, test compilation, all 304 Node tests, all 79 Python boundary tests, production build and shell/browser syntax checks. Zero Node failures, cancellations or skips. This includes the unchanged GC timeout regression, ten independent abort probes, fifteen independent lifecycle/audit/shutdown probes and both deployment suites. Evidence: `crc-round23-integration.log` under the designated TMPDIR. R2-L01, R2-A01, R2-P01, R2-T01, R2-H01 and R3-D01 are closed within their synthetic scope.
+
+Fresh independent UI source review found no new substantive defect and added seven nearby probes. Parent browser execution passed all eight original round-three probes and all seven review probes at 1280×800 and 320×812: 140 assertions, zero failures, zero harness errors and no unexpected application fetches. The unchanged baseline suite passed all 40 assertions at each width and again in 320px dark mode. Native Escape closed log/create dialogs and restored focus. The session-expiry probe navigated an owned iframe to the loopback login refusal endpoint with `/settings` retained; successful synthetic logout reached `/__signed-out`. These do not certify real Authentik logout/sign-in.
+
+The keyboard traversal reached both create fields and Cancel. Native browser focus briefly reported the document body when leaving the last enabled modal control, then returned to the first field; no claim of complete keyboard or assistive-technology certification is made. Both native Escape checks passed. Evidence: `crc-round3-browser-after.json`. Initial browser automation attempts rejected trailing whitespace in injected JavaScript, and an initial baseline invocation returned an unresolved promise; neither was counted. Corrected tool invocation returned every assertion above. No application or test assertion was changed.
+
+R3-U01 and R3-U02 are closed within the verified browser scope. Owned preview tab closed, fixture PID 1519147 stopped, session exited 143 and port 5173 was confirmed absent. The batch released heavy.lock; future unrelated suites will release and reacquire it separately following cross-project coordination.
+
+Rounds two and three are complete with findings and verified fixes. They do not establish a clean-round streak. At least three meaningful new rounds have now run, but two consecutive independent clean rounds remain required. Round-four preparation has only inactive probes so far. Live/native acceptance limits and the accepted non-atomic job-start race remain unchanged.
+
+Verified implementation batches are `ee22f9f` for monotonic confirmation, `0a7da1b` for audit/shutdown durability, `c238bfb` for generated fixture keys, `7f619d6` for HTTP reader aborts, `18b462a` for staging cleanup and `235cb32` for UI response ordering. The parent is publishing these reviewed signed commits with this ledger to `origin/hardening-audit-rounds`. The topic branch has no deployment trigger. No PR, merge, release or deployment is requested or performed.
