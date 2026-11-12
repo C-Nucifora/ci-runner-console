@@ -23,16 +23,22 @@ export function RunnersView({ inventory, me, busy, unavailable, onAction, onDele
   const [adding, setAdding] = useState(false);
   const [logs, setLogs] = useState<{ name: string; lines: string[] } | null>(null);
   const [logError, setLogError] = useState<string | null>(null);
+  const logRequest = useRef(0);
+
+  useEffect(() => () => { ++logRequest.current; }, []);
 
   const groups = useMemo(() => groupRunners(inventory?.runners ?? []), [inventory]);
   const counts = useMemo(() => countStates(inventory?.runners ?? []), [inventory]);
 
   async function showLogs(name: string) {
+    const request = ++logRequest.current;
     setLogError(null);
     try {
       const { lines } = await api.logs(name);
+      if (request !== logRequest.current) return;
       setLogs({ name, lines });
     } catch (err) {
+      if (request !== logRequest.current) return;
       setLogError(err instanceof Error ? err.message : String(err));
     }
   }
@@ -163,7 +169,10 @@ export function RunnersView({ inventory, me, busy, unavailable, onAction, onDele
         />
       ) : null}
 
-      {logs ? <LogDialog name={logs.name} lines={logs.lines} onClose={() => setLogs(null)} /> : null}
+      {logs ? <LogDialog name={logs.name} lines={logs.lines} onClose={() => {
+        ++logRequest.current;
+        setLogs(null);
+      }} /> : null}
     </>
   );
 }

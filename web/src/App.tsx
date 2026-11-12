@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
 import { ATTENTION_STATES } from './components';
 import { RunnersView, type Action } from './RunnersView';
@@ -28,6 +28,9 @@ export function App() {
   const [signingOut, setSigningOut] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const mounted = useRef(false);
+  const inventoryRequest = useRef(0);
+  const pendingRefresh = useRef<Promise<void> | null>(null);
 
   const pushToast = useCallback((t: Omit<Toast, 'id'>) => {
     const id = Date.now() + Math.random();
@@ -49,21 +52,37 @@ export function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  const refresh = useCallback(async () => {
-    try {
-      setInventory(await api.inventory());
+  const refresh = useCallback(() => {
+    if (!mounted.current) return Promise.resolve();
+    const request = ++inventoryRequest.current;
+    const pending = api.inventory().then((next) => {
+      if (request !== inventoryRequest.current) return;
+      setInventory(next);
       setFatal(null);
-    } catch (err) {
+    }).catch((err: unknown) => {
+      if (request !== inventoryRequest.current) return;
       if (err instanceof ApiError && err.status === 401) return;
       setFatal(err instanceof Error ? err.message : String(err));
-    }
+    }).finally(() => {
+      if (request === inventoryRequest.current) pendingRefresh.current = null;
+    });
+    pendingRefresh.current = pending;
+    return pending;
   }, []);
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => undefined);
+    mounted.current = true;
+    let active = true;
+    api.me().then((next) => { if (active) setMe(next); }).catch(() => undefined);
     void refresh();
     const timer = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(timer);
+    return () => {
+      active = false;
+      mounted.current = false;
+      ++inventoryRequest.current;
+      pendingRefresh.current = null;
+      clearInterval(timer);
+    };
   }, [refresh]);
 
   /** Runs a mutation, reports it as a toast, and re-reads state either way. */
@@ -72,11 +91,11 @@ export function App() {
       setBusy(key);
       try {
         await fn();
-        pushToast({ tone: 'good', message: success });
+        if (mounted.current) pushToast({ tone: 'good', message: success });
         return null;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        pushToast({
+        if (mounted.current) pushToast({
           tone: 'critical',
           message,
           hint: err instanceof ApiError ? err.hint : undefined,
@@ -84,7 +103,9 @@ export function App() {
         return err instanceof ApiError && err.hint ? `${message} ${err.hint}` : message;
       } finally {
         await refresh();
-        setBusy(null);
+        // A newer poll can supersede the mutation's reconciliation request.
+        while (mounted.current && pendingRefresh.current) await pendingRefresh.current;
+        if (mounted.current) setBusy(null);
       }
     },
     [pushToast, refresh],
