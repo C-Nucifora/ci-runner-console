@@ -123,8 +123,13 @@ export class AuditLog {
       const size = info.size;
       const start = Math.max(0, size - 1024 * 1024);
       const buffer = Buffer.alloc(size - start);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      let text = buffer.subarray(0, bytesRead).toString('utf8');
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, start + offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      let text = buffer.subarray(0, offset).toString('utf8');
       if (start > 0) text = text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '';
       // Ignore an incomplete final append until it has a terminating newline.
       text = text.slice(0, text.lastIndexOf('\n') + 1);
