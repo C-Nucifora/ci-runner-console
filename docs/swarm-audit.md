@@ -20,6 +20,17 @@ The user now authorizes signed commits and normal pushes to dedicated topic bran
 | Configuration and deployment | Secrets remain private and services remain confined | Invalid config, installation/deployment refusal, container constraints, listener and proxy inspection |
 | Browser and operator recovery | Pending/stale state cannot authorize conflicting actions; failures remain actionable | Refresh/action races, modal transitions, sign-out, keyboard/mobile/error-state sequences |
 
+## Current status
+
+| Round | Result | Publication |
+| --- | --- | --- |
+| 1 | Confirmed defects fixed and reviewed; 219 Node and 69 VM tests passed | Through `ce70d9e` |
+| 2 | Lifecycle, durability, shutdown and HTTP deadlines fixed and independently challenged | Through `f1f7c1e`; combined verification: 304 Node tests |
+| 3 | Deployment cleanup and UI response ordering fixed and independently challenged | Through `f1f7c1e`; 79 Python tests, 140 new browser assertions and baseline checks passed |
+| 4 | Audit short-read loss fixed; 313 Node and 83 Python tests passed | Included in final draft PR |
+
+Clean-round streak: zero. Live acceptance remains separate and unperformed. The final user request ends further audit rounds; the earlier two-clean-round target is unmet and deferred.
+
 ## Host coordination
 
 Start with two lightweight breakers. Share capacity status at `/home/christian/.local/state/agent-swarms/ci-runner-console.json`. Serialize every build/test/property/fuzz/browser job with `flock /home/christian/.local/state/agent-swarms/heavy.lock`; use `TMPDIR=/home/christian/.local/share/agent-tmp`, low compiler parallelism and one test worker. All owned listeners bind to `127.0.0.1`. Rootless Docker uses `unix:///run/user/1001/docker.sock`. Stop owned services and leave other projects' state alone.
@@ -74,7 +85,7 @@ Executed under the shared lock with the designated TMPDIR: `node --import tsx --
 
 ## Deferred work
 
-The user requested a checkpoint and pause on 2026-11-12, then explicitly resumed the extended goal. The three-round minimum and two consecutive clean rounds have not been reached. Round 1 has completed with findings and verified fixes; rounds 2 and 3 remain required. The following priorities remain approved.
+The user requested a checkpoint and pause on 2026-11-12, then explicitly resumed the extended goal. At that checkpoint, the three-round minimum and two consecutive clean rounds had not been reached. Rounds 2 and 3 have since completed; see the current status above. The following recorded priorities guided the resumed work.
 
 
 Round 2 will emphasize cross-request lifecycle, concurrency, partial failures and durable audit/shutdown recovery. Round 3 will emphasize browser/operator sequences, configuration/deployment boundaries and challenges near earlier fixes. Findings may change these priorities, but cannot remove required matrix coverage or substitute old tests for new experiments. Count a clean round only after its fresh independent challenge completes; record any remaining acceptance limits explicitly.
@@ -277,3 +288,25 @@ R3-U01 and R3-U02 are closed within the verified browser scope. Owned preview ta
 Rounds two and three are complete with findings and verified fixes. They do not establish a clean-round streak. At least three meaningful new rounds have now run, but two consecutive independent clean rounds remain required. Round-four preparation has only inactive probes so far. Live/native acceptance limits and the accepted non-atomic job-start race remain unchanged.
 
 Verified implementation batches are `ee22f9f` for monotonic confirmation, `0a7da1b` for audit/shutdown durability, `c238bfb` for generated fixture keys, `7f619d6` for HTTP reader aborts, `18b462a` for staging cleanup and `235cb32` for UI response ordering. The parent is publishing these reviewed signed commits with this ledger to `origin/hardening-audit-rounds`. The topic branch has no deployment trigger. No PR, merge, release or deployment is requested or performed.
+
+## Round 4
+
+Two independent breakers prepared new boundary and recovery probes while earlier checks queued. After round-three verification, the parent inspected their strict fakes, finite case counts, temporary-state cleanup and no-network setup, then activated them. The boundary probes cover failed-login replay/recovery, nine signed group lookalikes, malformed-to-valid replies across eight VM operations, wrapper framing, configuration permissions, hardlinked marker cleanup and literal log-count limits. Recovery probes cover short file reads, interleaved operation histories/redaction and mixed inventory outages/recovery in both input orders. The short-read issue is a source hypothesis, not a confirmed finding before execution. Each bounded suite will release heavy.lock separately. No clean-round credit yet.
+
+### Final bounded handoff
+
+The 2026-11-13 final instruction supersedes continued rounds. No new workers or audit rounds were started. The existing workers had finished and their probe files were collected. The old shell processes were absent after the server restart. The original Node attempt failed compilation because a test passed `undefined` to an assertion overload; replacing it with `Error` retains the rejection assertion. The previous VM attempt completed all four probes successfully.
+
+| ID | Severity | Reproduction and root cause | Fix | Verification |
+| --- | --- | --- | --- | --- |
+| R4-A01 | Medium | Both existing short-read probes returned no audit entries despite complete outcomes on disk. A single FileHandle.read was treated as the entire tail. | Continue positional reads until the original one-MiB buffer is filled or EOF returns zero; preserve complete-line parsing, redaction, order and deduplication. | Before fix: six Node probes passed, two failed. Added an EOF termination regression; final suite results follow. |
+
+The owner reviewed the three pending probe files and the final reader change. Earlier independent review remains documented above; no fresh independent signoff is claimed for R4-A01. Tests use synthetic state and strict fakes. No live acceptance or browser rerun is included in this final batch. Historical desktop/mobile results remain valid only for their recorded scope.
+
+Last-push evidence is the remote-tracking reflog at 2026-11-12 12:03:01 AEST, `f1f7c1e`. GitHub public push events returned no matching record. New signed commits use a short interval near final verification, within the period since that push. The existing neutral branch is `hardening-audit-rounds`; the PR base is `master` at `247135a5b6dbd224b5a840a53fedb6dd09a118b2`. Workflow inspection found verification only on pull requests and master pushes, with read-only contents permission and no deployment trigger. No protections are disabled.
+
+The PR remains draft. Acceptance needs an approved deployment target, real Authentik provider/group/proxy configuration, pinned runner-VM access, and a disposable GitHub runner/job target. The VPS cannot reach home machines. Effective deployed confinement, full production shutdown deadlines, power-loss durability and complete assistive-technology acceptance remain unverified. The accepted non-atomic busy-job race remains documented in hardening-audit.md. No live infrastructure was changed.
+
+Final verification on 2026-11-13 passed test compilation, all 313 Node tests with one worker, all 83 Python tests, server/frontend typechecks, production build and `git diff --check`. There is no configured lint command. Separate bounded jobs acquired and released the shared lock. Evidence under `/home/christian/.local/share/agent-tmp`: `crc-final-probes-before.log`, `crc-final-node.log`, `crc-final-vm.log` and `crc-final-build.log`. The before-fix log retains both failures; the original compiler failure remains in `crc-round4-node-before.log`. No tests were weakened or skipped. No temporary service was started during final verification, and no old owned test/service process remained. The final change has owner review and passing regressions, but no new independent reviewer.
+
+The user requested publication and then pause. Further audit rounds and live acceptance are not scheduled. The website and dashboard work streams are outside this repository and were left to their owners.
